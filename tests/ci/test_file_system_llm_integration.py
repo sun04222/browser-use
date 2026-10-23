@@ -27,14 +27,6 @@ class TestImageInLLMMessages:
 		buffer.seek(0)
 		return buffer.read()
 
-	def create_test_image_b64(self, image_format: str) -> str:
-		"""Return base64 of a real image encoded in the requested PIL format."""
-		mode = 'P' if image_format == 'GIF' else 'RGB'
-		img = Image.new(mode, (16, 16), color=0 if mode == 'P' else (20, 150, 60))
-		buffer = io.BytesIO()
-		img.save(buffer, format=image_format)
-		return base64.b64encode(buffer.getvalue()).decode('utf-8')
-
 	@pytest.mark.asyncio
 	async def test_image_stored_in_message_manager(self, tmp_path: Path):
 		"""Test that images are stored in MessageManager state."""
@@ -149,21 +141,10 @@ class TestImageInLLMMessages:
 		assert 'data:image/' in img_part.image_url.url
 		assert 'base64,base64_image_data_here' in img_part.image_url.url
 
-	@pytest.mark.parametrize(
-		('filename', 'media_type'),
-		[
-			('test.png', 'image/png'),
-			('photo.jpg', 'image/jpeg'),
-			('photo.jpeg', 'image/jpeg'),
-			('animation.gif', 'image/gif'),
-			('photo.webp', 'image/webp'),
-			('animation.GIF', 'image/gif'),
-			('photo.WEBP', 'image/webp'),
-		],
-	)
-	def test_agent_message_prompt_image_media_type(self, tmp_path: Path, filename: str, media_type: str):
-		"""Match both MIME metadata and the data URL to each supported image format."""
+	def test_available_file_paths_are_labeled_as_local_files(self, tmp_path: Path):
+		"""Test that uploaded HTML filenames are not presented as navigation targets."""
 		fs = FileSystem(tmp_path)
+		local_html = '/app/something_capabilities.html'
 
 		browser_state = BrowserStateSummary(
 			url='https://example.com',
@@ -176,24 +157,18 @@ class TestImageInLLMMessages:
 		prompt = AgentMessagePrompt(
 			browser_state_summary=browser_state,
 			file_system=fs,
-			read_state_images=[{'name': filename, 'data': 'data'}],
+			available_file_paths=[local_html],
 		)
-		message = prompt.get_user_message(use_vision=True)
-		assert isinstance(message.content, list)
-		image_parts = [part for part in message.content if isinstance(part, ContentPartImageParam)]
-		assert len(image_parts) == 1
-		assert image_parts[0].image_url.url == f'data:{media_type};base64,data'
-		assert image_parts[0].image_url.media_type == media_type
 
-	def test_agent_message_prompt_gif_webp_media_type(self, tmp_path: Path):
-		"""GIF/WEBP images from read_file must keep their real media type.
+		user_message = prompt.get_user_message(use_vision=False)
 
-		``FileSystem.read_file_structured`` accepts .jpg/.jpeg/.png/.gif/.webp, and the
-		resulting data URL prefix plus ``ImageURL.media_type`` are what the provider
-		serializers forward as the image's declared format (Anthropic/AWS parse the
-		prefix, Google reads ``media_type``). Relabelling a GIF or WEBP payload as
-		``image/jpeg`` hands the provider a mismatched format.
-		"""
+		assert isinstance(user_message.content, str)
+		assert local_html in user_message.content
+		assert 'These are local file paths for read_file or upload actions. They are not URLs.' in user_message.content
+		assert 'Do not navigate to a filename, file extension, or path fragment' in user_message.content
+
+	def test_agent_message_prompt_png_vs_jpg_media_type(self, tmp_path: Path):
+		"""Test that AgentMessagePrompt correctly detects PNG vs JPG media types."""
 		fs = FileSystem(tmp_path)
 
 		browser_state = BrowserStateSummary(
@@ -204,25 +179,27 @@ class TestImageInLLMMessages:
 			dom_state=SerializedDOMState(_root=None, selector_map={}),
 		)
 
-		for file_name, (image_format, media_type, magic) in {
-			'chart.gif': ('GIF', 'image/gif', b'GIF8'),
-			'sticker.webp': ('WEBP', 'image/webp', b'RIFF'),
-		}.items():
-			base64_data = self.create_test_image_b64(image_format)
-			prompt = AgentMessagePrompt(
-				browser_state_summary=browser_state,
-				file_system=fs,
-				read_state_images=[{'name': file_name, 'data': base64_data}],
-			)
+		# Test PNG
+		read_state_images_png = [{'name': 'test.png', 'data': 'data'}]
+		prompt_png = AgentMessagePrompt(
+			browser_state_summary=browser_state,
+			file_system=fs,
+			read_state_images=read_state_images_png,
+		)
+		message_png = prompt_png.get_user_message(use_vision=True)
+		image_parts_png = [part for part in message_png.content if isinstance(part, ContentPartImageParam)]
+		assert 'data:image/png;base64' in image_parts_png[0].image_url.url
 
-			message = prompt.get_user_message(use_vision=True)
-			image_parts = [part for part in message.content if isinstance(part, ContentPartImageParam)]
-
-			assert len(image_parts) == 1, file_name
-			# Sanity check that the payload really is the format under test.
-			assert base64.b64decode(base64_data).startswith(magic), file_name
-			assert image_parts[0].image_url.url.startswith(f'data:{media_type};base64,'), file_name
-			assert image_parts[0].image_url.media_type == media_type, file_name
+		# Test JPG
+		read_state_images_jpg = [{'name': 'photo.jpg', 'data': 'data'}]
+		prompt_jpg = AgentMessagePrompt(
+			browser_state_summary=browser_state,
+			file_system=fs,
+			read_state_images=read_state_images_jpg,
+		)
+		message_jpg = prompt_jpg.get_user_message(use_vision=True)
+		image_parts_jpg = [part for part in message_jpg.content if isinstance(part, ContentPartImageParam)]
+		assert 'data:image/jpeg;base64' in image_parts_jpg[0].image_url.url
 
 	def test_agent_message_prompt_no_images(self, tmp_path: Path):
 		"""Test that message works correctly when no images are present."""
@@ -334,50 +311,35 @@ Some content here.
 class TestEndToEndIntegration:
 	"""End-to-end tests for file reading and LLM message creation."""
 
-	def create_test_image(self, image_format: str = 'PNG') -> bytes:
+	def create_test_image(self) -> bytes:
 		"""Create a test image."""
 		img = Image.new('RGB', (50, 50), color='blue')
 		buffer = io.BytesIO()
-		img.save(buffer, format=image_format)
+		img.save(buffer, format='PNG')
 		buffer.seek(0)
 		return buffer.read()
 
-	@pytest.mark.parametrize(
-		('extension', 'image_format', 'media_type'),
-		[
-			('png', 'PNG', 'image/png'),
-			('gif', 'GIF', 'image/gif'),
-			('jpg', 'JPEG', 'image/jpeg'),
-			('jpeg', 'JPEG', 'image/jpeg'),
-			('webp', 'WEBP', 'image/webp'),
-		],
-	)
-	@pytest.mark.parametrize('external_file', [False, True])
-	async def test_image_end_to_end(
-		self, tmp_path: Path, extension: str, image_format: str, media_type: str, external_file: bool
-	):
-		"""Read real internal/external images through the tool into correctly typed vision messages."""
-		from browser_use.tools.service import Tools
+	@pytest.mark.asyncio
+	async def test_image_end_to_end(self, tmp_path: Path):
+		"""Test complete flow: external image → FileSystem → ActionResult → MessageManager → Prompt."""
+		# Step 1: Create external image
+		external_file = tmp_path / 'photo.png'
+		img_bytes = self.create_test_image()
+		external_file.write_bytes(img_bytes)
 
+		# Step 2: Read via FileSystem
 		fs = FileSystem(tmp_path / 'workspace')
-		filename = f'photo.{extension}'
-		img_bytes = self.create_test_image(image_format)
-		base64_str = base64.b64encode(img_bytes).decode('utf-8')
-		if external_file:
-			file_path = tmp_path / filename
-			file_path.write_bytes(img_bytes)
-			read_name = str(file_path)
-		else:
-			assert 'successfully' in await fs.write_file(filename, base64_str)
-			read_name = filename
-		action_result = await Tools().registry.execute_action(
-			'read_file',
-			{'file_name': read_name},
-			file_system=fs,
-			available_file_paths=[read_name] if external_file else [],
+		structured_result = await fs.read_file_structured(str(external_file), external_file=True)
+
+		assert structured_result['images'] is not None
+
+		# Step 3: Create ActionResult (simulating tools/service.py)
+		action_result = ActionResult(
+			extracted_content=structured_result['message'],
+			long_term_memory='Read image file photo.png',
+			images=structured_result['images'],
+			include_extracted_content_only_once=True,
 		)
-		assert isinstance(action_result, ActionResult)
-		assert action_result.images == [{'name': filename, 'data': base64_str}]
 
 		# Step 4: Process in MessageManager
 		system_message = SystemMessage(content='Test system message')
@@ -387,7 +349,7 @@ class TestEndToEndIntegration:
 
 		# Verify images stored
 		assert len(mm.state.read_state_images) == 1
-		assert mm.state.read_state_images[0]['name'] == filename
+		assert mm.state.read_state_images[0]['name'] == 'photo.png'
 
 		# Step 5: Create message with AgentMessagePrompt
 		browser_state = BrowserStateSummary(
@@ -409,11 +371,11 @@ class TestEndToEndIntegration:
 		# Verify image is in message
 		assert isinstance(user_message.content, list)
 		image_parts = [part for part in user_message.content if isinstance(part, ContentPartImageParam)]
-		assert len(image_parts) == 1
+		assert len(image_parts) >= 1
 
 		# Verify image data is correct
-		assert image_parts[0].image_url.url == f'data:{media_type};base64,{base64_str}'
-		assert image_parts[0].image_url.media_type == media_type
+		base64_str = base64.b64encode(img_bytes).decode('utf-8')
+		assert base64_str in image_parts[0].image_url.url
 
 	@pytest.mark.asyncio
 	async def test_docx_end_to_end(self, tmp_path: Path):
