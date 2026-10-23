@@ -314,8 +314,6 @@ def _add_overlay_to_image(
 	image = image.convert('RGBA')
 	txt_layer = Image.new('RGBA', image.size, (0, 0, 0, 0))
 	draw = ImageDraw.Draw(txt_layer)
-	padding = 20
-	y_step = image.height - margin - 10
 	if display_step:
 		# Add step number (bottom left)
 		step_text = str(step_number)
@@ -348,6 +346,11 @@ def _add_overlay_to_image(
 			font=title_font,
 			fill=text_color,
 		)
+	else:
+		# No step badge: anchor the goal text the same way with zero step height
+		step_height = 0
+		padding = 20
+		y_step = image.height - margin - step_height - 10
 
 	# Draw goal text (centered, bottom)
 	max_width = image.width - (4 * margin)
