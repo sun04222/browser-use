@@ -314,12 +314,8 @@ def _add_overlay_to_image(
 	image = image.convert('RGBA')
 	txt_layer = Image.new('RGBA', image.size, (0, 0, 0, 0))
 	draw = ImageDraw.Draw(txt_layer)
-
-	# Base anchor and padding for the overlay layout. Used as-is when display_step=False;
-	# y_step is shifted up by the step badge height below when the badge is shown.
-	padding = 20  # Increased padding
-	y_step = image.height - margin - 10  # Slight offset from bottom
-
+	padding = 20
+	y_step = image.height - margin - 10
 	if display_step:
 		# Add step number (bottom left)
 		step_text = str(step_number)
@@ -332,6 +328,7 @@ def _add_overlay_to_image(
 		y_step = image.height - margin - step_height - 10  # Slight offset from bottom
 
 		# Draw rounded rectangle background for step number
+		padding = 20  # Increased padding
 		step_bg_bbox = (
 			x_step - padding,
 			y_step - padding,
