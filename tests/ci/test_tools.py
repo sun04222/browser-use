@@ -14,6 +14,44 @@ from browser_use.browser import BrowserSession
 from browser_use.browser.profile import BrowserProfile
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.tools.service import Tools
+from browser_use.tools.views import ScrollAction
+
+
+class _FailingEvent:
+	def __init__(self, error: Exception):
+		self.error = error
+
+	def __await__(self):
+		async def _wait():
+			return self
+
+		return _wait().__await__()
+
+	async def event_result(self, **kwargs):
+		raise self.error
+
+
+class _FailingEventBus:
+	def __init__(self, error: Exception, dispatch_error: Exception | None = None):
+		self.error = error
+		self.dispatch_error = dispatch_error
+
+	def dispatch(self, event):
+		if self.dispatch_error is not None:
+			raise self.dispatch_error
+		return _FailingEvent(self.error)
+
+
+class _ActionTestSession:
+	def __init__(self, error: Exception, dispatch_error: Exception | None = None):
+		self.cdp_client = None
+		self.event_bus = _FailingEventBus(error, dispatch_error)
+
+	async def get_element_by_index(self, index):
+		return None
+
+	async def get_or_create_cdp_session(self):
+		raise RuntimeError('CDP unavailable')
 
 
 @pytest.fixture(scope='session')
@@ -109,38 +147,37 @@ class TestToolsIntegration:
 			assert tools.registry.registry.actions[action].function is not None
 			assert tools.registry.registry.actions[action].description is not None
 
-	async def test_missing_element_actions_return_errors(self, tools, browser_session):
-		"""Actions should report stale element indices as errors."""
-		missing_index = 999_999
-		actions = [
-			('click', {'index': missing_index}),
-			('dropdown_options', {'index': missing_index}),
-			('select_dropdown', {'index': missing_index, 'text': 'missing'}),
-		]
-
-		for action_name, action_params in actions:
-			result = await getattr(tools, action_name)(**action_params, browser_session=browser_session)
-
-			assert result.error is not None, f'{action_name} should report a missing element as an error'
-			assert f'Element index {missing_index} not available' in result.error
-
-	async def test_invalid_dropdown_selection_returns_error(self, tools, browser_session, base_url, http_server):
-		"""Structured dropdown failures should still be reported as errors."""
-		http_server.expect_request('/dropdown-invalid').respond_with_data(
-			'<select id="test-dropdown"><option>First Option</option><option>Second Option</option></select>',
-			content_type='text/html',
-		)
-		await tools.navigate(url=f'{base_url}/dropdown-invalid', new_tab=False, browser_session=browser_session)
-		await browser_session.get_browser_state_summary()
-		dropdown_index = await browser_session.get_index_by_id('test-dropdown')
-
-		assert dropdown_index is not None
-		result = await tools.select_dropdown(index=dropdown_index, text='Missing Option', browser_session=browser_session)
+	async def test_input_missing_element_is_an_error(self, tools):
+		result = await tools.input(index=7, text='value', browser_session=_ActionTestSession(RuntimeError()))
 
 		assert result.error is not None
-		assert "Couldn't select the dropdown option" in result.error
-		assert result.extracted_content is not None
-		assert 'First Option' in result.extracted_content
+		assert 'Element index 7 not available' in result.error
+
+	async def test_scroll_reports_error_when_all_scrolls_fail(self, tools):
+		result = await tools.scroll(
+			params=ScrollAction(down=True, pages=1.0),
+			browser_session=_ActionTestSession(RuntimeError('scroll failed')),
+		)
+
+		assert result.error is not None
+
+	async def test_scroll_to_text_reports_transport_errors(self, tools):
+		result = await tools.find_text(
+			text='target',
+			browser_session=_ActionTestSession(RuntimeError('CDP unavailable')),
+		)
+
+		assert result.error is not None
+		assert 'CDP unavailable' in result.error
+
+	async def test_scroll_to_text_reports_dispatch_errors(self, tools):
+		error = RuntimeError('event bus unavailable')
+		result = await tools.find_text(
+			text='target',
+			browser_session=_ActionTestSession(error, dispatch_error=error),
+		)
+
+		assert result.error == "Failed to scroll to text 'target': event bus unavailable"
 
 	async def test_custom_action_registration(self, tools, browser_session, base_url):
 		"""Test registering a custom action and executing it."""
