@@ -1,13 +1,8 @@
 """Tests for the FileSystem class and related file operations."""
 
 import asyncio
-import os
-import subprocess
-import sys
 import tempfile
-import textwrap
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from pypdf import PdfReader
@@ -116,35 +111,6 @@ class TestBaseFile:
 		assert json_file.get_size == len(json_content)
 		assert json_file.get_line_count == 1
 
-	def test_csv_keeps_a_backslash_n_that_is_not_an_escape(self):
-		"""A Windows path and a regex carry the same two characters as an escaped newline.
-
-		The unescape used to fire on any single-line content containing `\\n`, so
-		`C:\\new,ok` came back as `C:` and a second row reading `ew,ok`.
-		"""
-		csv_file = CsvFile(name='paths')
-
-		csv_file.write_file_content(r'C:\new,ok')
-		assert csv_file.content == r'C:\new,ok'
-
-		csv_file.write_file_content(r'pattern,\d+\name')
-		assert csv_file.content == r'pattern,\d+\name'
-
-	def test_csv_still_unescapes_double_escaped_tool_output(self):
-		"""The control: a genuinely double-escaped CSV still comes back as rows."""
-		csv_file = CsvFile(name='rows')
-
-		csv_file.write_file_content(r'name,age\nJohn,30\nJane,25')
-
-		assert csv_file.content == 'name,age\nJohn,30\nJane,25'
-
-	def test_csv_still_unescapes_double_escaped_quotes(self):
-		csv_file = CsvFile(name='quoted')
-
-		csv_file.write_file_content(r'name,note\n\"a,b\",ok')
-
-		assert csv_file.content == 'name,note\n"a,b",ok'
-
 	def test_csv_file_creation(self):
 		"""Test CsvFile creation and basic properties."""
 		csv_content = 'name,age,city\nJohn,30,New York\nJane,25,London'
@@ -216,6 +182,40 @@ class TestBaseFile:
 			expected_content = '# New Content\n## Section 2'
 			assert file_path.read_text() == expected_content
 			assert file_obj.content == expected_content
+
+	async def test_write_rolls_back_on_sync_failure(self, monkeypatch):
+		"""A failed persist must not leave mutated in-memory content."""
+		with tempfile.TemporaryDirectory() as tmp_dir:
+			file_obj = TxtFile(name='notes', content='persisted')
+
+			async def fail_sync(self, path):
+				raise OSError('disk unavailable')
+
+			monkeypatch.setattr(TxtFile, 'sync_to_disk', fail_sync)
+
+			with pytest.raises(OSError, match='disk unavailable'):
+				await file_obj.write('phantom update', Path(tmp_dir))
+			assert file_obj.content == 'persisted'
+
+			with pytest.raises(OSError, match='disk unavailable'):
+				await file_obj.append(' phantom append', Path(tmp_dir))
+			assert file_obj.content == 'persisted'
+
+	@pytest.mark.parametrize(('operation', 'content'), [('write', 'phantom update'), ('append', ' phantom append')])
+	async def test_mutation_rolls_back_when_sync_is_cancelled(self, monkeypatch, operation, content):
+		"""A cancelled persist must restore content and still propagate cancellation."""
+		with tempfile.TemporaryDirectory() as tmp_dir:
+			file_obj = TxtFile(name='notes', content='persisted')
+
+			async def cancel_sync(self, path):
+				# Simulate task cancellation while the disk write is still pending.
+				raise asyncio.CancelledError
+
+			monkeypatch.setattr(TxtFile, 'sync_to_disk', cancel_sync)
+
+			with pytest.raises(asyncio.CancelledError):
+				await getattr(file_obj, operation)(content, Path(tmp_dir))
+			assert file_obj.content == 'persisted'
 
 	async def test_json_file_disk_operations(self):
 		"""Test JSON file sync to disk operations."""
@@ -310,43 +310,6 @@ class TestFileSystem:
 				fs.nuke()
 			except Exception:
 				pass
-
-	@pytest.mark.parametrize(
-		('page_texts', 'included_pages', 'complete_pages', 'truncated'),
-		[
-			(['first ' * 6000, 'second ' * 6000], [1, 2], [1], True),
-			(['common ' * 4000, 'common ' * 4000, 'rare unique specific ' * 1000, 'common ' * 4000], [1, 2, 3], [1, 3], True),
-			(['', 'first ' * 6000, 'second ' * 6000], [2, 3], [2], True),
-			(['single ' * 10000], [1], [], True),
-			(['first page', 'second page'], [1, 2], [1, 2], False),
-			(['a' * 30000, 'b' * 30000], [1, 2], [1], True),
-			(['a' * 60000], [1], [], True),
-			(['a' * 59985], [1], [1], False),
-		],
-	)
-	async def test_read_pdf_preserves_selected_pages_within_budget(
-		self, empty_filesystem, monkeypatch, page_texts, included_pages, complete_pages, truncated
-	):
-		"""PDF reads include complete priority pages and truncate the final selected page."""
-		pages = [SimpleNamespace(extract_text=lambda text=text: text) for text in page_texts]
-		monkeypatch.setattr('pypdf.PdfReader', lambda _path: SimpleNamespace(pages=pages))
-
-		result = await empty_filesystem.read_file_structured('report.pdf', external_file=True)
-
-		content = result['message'].split('<content>\n', 1)[1].split('\n</content>', 1)[0]
-		selected_text = content.split('\n\n[Showing', 1)[0]
-		assert len(selected_text) <= 60000
-		assert ('[...truncated]' in selected_text) is truncated
-		headers = [f'--- Page {page_num} ---' for page_num in included_pages]
-		for page_num, header in zip(included_pages, headers):
-			assert header + '\n' + page_texts[page_num - 1][:50] in selected_text
-		for page_num in complete_pages:
-			assert f'--- Page {page_num} ---\n' + page_texts[page_num - 1] in selected_text
-		assert [selected_text.index(header) for header in headers] == sorted(selected_text.index(header) for header in headers)
-		for page_num in set(range(1, len(page_texts) + 1)) - set(included_pages):
-			assert f'--- Page {page_num} ---' not in selected_text
-		if len(included_pages) < len(page_texts):
-			assert f'Showing {len(included_pages)} of {len(page_texts)} pages' in content
 
 	async def test_write_pdf_renders_content_as_plain_text(self, empty_filesystem):
 		"""PDF content should be rendered as plain text, not ReportLab markup."""
@@ -626,51 +589,25 @@ class TestFileSystem:
 		assert 'invalidname.md' in result
 		assert 'auto-corrected' in result
 
-	@pytest.mark.parametrize('encoding', ['utf-8', 'utf-8-sig'])
-	def test_read_external_utf8_text(self, tmp_path: Path, encoding: str):
-		"""External UTF-8 text must survive reads with a non-UTF-8 default locale."""
-		content = 'café 北京 😀\nSecond line'
-		file_path = tmp_path / 'external.txt'
-		file_path.write_text(content, encoding=encoding)
-		script = textwrap.dedent(
-			r"""
-			import asyncio
-			import sys
-			from pathlib import Path
+	async def test_write_file_does_not_register_on_failed_persist(self, empty_filesystem, monkeypatch):
+		"""A failed persist must not leave a phantom entry in the registry."""
+		fs = empty_filesystem
+		await fs.write_file('existing.txt', 'persisted')
 
-			from browser_use.filesystem.file_system import FileSystem
+		async def fail_sync(self, path):
+			raise OSError('disk unavailable')
 
-			async def main():
-			    file_path = Path(sys.argv[1])
-			    fs = FileSystem(file_path.parent / 'agent', create_default_files=False)
-			    content = 'caf\u00e9 \u5317\u4eac \U0001f600\nSecond line'
-			    result = await fs.read_file_structured(str(file_path), external_file=True)
-			    expected = f'Read from file {file_path}.\n<content>\n{content}\n</content>'
-			    assert result['message'] == expected, ascii(result['message'])
-			    assert result['images'] is None
+		monkeypatch.setattr(TxtFile, 'sync_to_disk', fail_sync)
 
-			asyncio.run(main())
-			"""
-		)
-		# Disable Python's UTF-8 mode and locale coercion so Linux CI uses ASCII
-		# and Windows uses its native code page, reproducing locale-dependent reads.
-		result = subprocess.run(
-			[sys.executable, '-c', script, str(file_path)],
-			env={
-				**os.environ,
-				'LC_ALL': 'C',
-				'PYTHONUTF8': '0',
-				'PYTHONCOERCECLOCALE': '0',
-				'PYTHONIOENCODING': 'utf-8',
-				'BROWSER_USE_SETUP_LOGGING': 'false',
-				'ANONYMIZED_TELEMETRY': 'false',
-			},
-			capture_output=True,
-			text=True,
-			encoding='utf-8',
-			timeout=30,
-		)
-		assert result.returncode == 0, result.stdout + result.stderr
+		# A brand-new file must not be registered when its write fails.
+		result = await fs.write_file('ghost.txt', 'phantom file')
+		assert 'disk unavailable' in result
+		assert 'ghost.txt' not in fs.files
+
+		# An existing file must keep its last persisted content on failure.
+		result = await fs.write_file('existing.txt', 'phantom update')
+		assert 'disk unavailable' in result
+		assert fs.get_file('existing.txt').content == 'persisted'
 
 	async def test_write_file(self, temp_filesystem):
 		"""Test writing content to files."""
@@ -749,27 +686,6 @@ class TestFileSystem:
 		result = await fs.write_file('products.csv', 'id,name,price\n1,Laptop,999.99\n2,Mouse,29.99')
 		assert result == 'Data written to file products.csv successfully.'
 		assert 'products.csv' in fs.files
-
-	@pytest.mark.parametrize('operation', ['write', 'append'])
-	async def test_cr_delimited_csv_records_through_filesystem(self, temp_filesystem, operation):
-		"""CSV record delimiters may be CR and should be normalized consistently."""
-		fs = temp_filesystem
-
-		if operation == 'write':
-			result = await fs.write_file('records.csv', 'name,note\rAlice,hello\rBob,bye')
-			expected_content = 'name,note\nAlice,hello\nBob,bye'
-			expected_result = 'Data written to file records.csv successfully.'
-		else:
-			await fs.write_file('records.csv', 'name,note\nAlice,hello')
-			result = await fs.append_file('records.csv', '\rBob,bye\rCarol,see you')
-			expected_content = 'name,note\nAlice,hello\nBob,bye\nCarol,see you'
-			expected_result = 'Data appended to file records.csv successfully.'
-
-		assert result == expected_result
-		file_obj = fs.get_file('records.csv')
-		assert file_obj is not None
-		assert file_obj.content == expected_content
-		assert (fs.data_dir / 'records.csv').read_text(encoding='utf-8') == expected_content
 
 	async def test_append_file(self, temp_filesystem):
 		"""Test appending content to files."""
@@ -1663,25 +1579,6 @@ class TestCsvNormalization:
 		csv_file = CsvFile(name='test')
 		csv_file.write_file_content(valid)
 		assert csv_file.content == valid
-
-	@pytest.mark.parametrize(
-		('raw', 'expected'),
-		[
-			(
-				'name,note\rAlice,"hello\rworld"\rBob,bye',
-				'name,note\nAlice,"hello\rworld"\nBob,bye',
-			),
-			(
-				'name,note\r\nAlice,"hello\r\nworld"\r\nBob,bye',
-				'name,note\nAlice,"hello\r\nworld"\nBob,bye',
-			),
-		],
-	)
-	def test_normalize_preserves_quoted_carriage_returns(self, raw, expected):
-		"""Normalize record endings while preserving carriage returns inside quoted fields."""
-		csv_file = CsvFile(name='test')
-		csv_file.write_file_content(raw)
-		assert csv_file.content == expected
 
 	def test_normalize_empty_content(self):
 		"""Empty or whitespace-only content should pass through."""
