@@ -310,19 +310,19 @@ llm = ChatOpenAI(
 
 Use the `/v1` base URL (not `/v1/chat/completions`). Pass catalog model ids as-is (no `openai/` prefix). The default `deepseek-v4-flash` model is text-only — set `use_vision=False` on the agent unless you pick a vision-capable model. List available models with `GET https://api.pzero.studio/v1/models` (no auth required).
 
-### AI Stupid Level
+### Opper
 ```python
 import os
 
 llm = ChatOpenAI(
-    model="auto-tooling",
-    base_url="https://aistupidlevel.info/v1",
-    api_key=os.environ["ASL_ROUTER_KEY"],
+    model="claude-sonnet-4-6",
+    base_url="https://api.opper.ai/v3/compat",
+    api_key=os.environ["OPPER_API_KEY"],
 )
 ```
-**Env:** `ASL_ROUTER_KEY` — create a router key at https://aistupidlevel.info/router/keys
+**Env:** `OPPER_API_KEY`, get a key at https://platform.opper.ai
 
-A router: `auto-tooling` sends each step to the model that currently scores best on its continuously re-run tool-use benchmark. Other routing modes include `auto-coding`, `auto-reasoning` and `auto-best`; see the [router docs](https://aistupidlevel.info/router/docs#strategies) for the full list. The router calls the chosen model with your own provider API keys (OpenAI, Anthropic, Google, DeepSeek, Kimi or GLM), which you add once at https://aistupidlevel.info/router/providers; browser-use itself only needs `ASL_ROUTER_KEY`. It accepts text only, so set `use_vision=False` on the agent.
+Opper is an EU-hosted AI gateway with 700+ models from 50+ providers behind one OpenAI-compatible API. Use the `/v3/compat` base URL (not `/v3/compat/chat/completions`). Model names such as `claude-sonnet-4-6` or `gpt-5.4-mini` cover every provider that serves the model, and Opper picks one per request. Browse models at https://opper.ai/models.
 
 ### LangChain
 See example at [examples/models/langchain](https://github.com/browser-use/browser-use/tree/main/examples/models/langchain).
