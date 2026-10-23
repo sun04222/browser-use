@@ -14,11 +14,11 @@ Usage:
 import os
 from typing import TYPE_CHECKING
 
+from browser_use.llm.avian.chat import ChatAvian
 from browser_use.llm.azure.chat import ChatAzureOpenAI
 from browser_use.llm.browser_use.chat import ChatBrowserUse
 from browser_use.llm.cerebras.chat import ChatCerebras
 from browser_use.llm.google.chat import ChatGoogle
-from browser_use.llm.minimax.chat import ChatMiniMax
 from browser_use.llm.mistral.chat import ChatMistral
 from browser_use.llm.openai.chat import ChatOpenAI
 
@@ -72,6 +72,11 @@ mistral_small: 'BaseChatModel'
 codestral: 'BaseChatModel'
 pixtral_large: 'BaseChatModel'
 
+avian_deepseek_v3_2: 'BaseChatModel'
+avian_kimi_k2_5: 'BaseChatModel'
+avian_glm_5: 'BaseChatModel'
+avian_minimax_m2_5: 'BaseChatModel'
+
 anthropic_claude_sonnet_4_0: 'BaseChatModel'
 anthropic_claude_fable_5: 'BaseChatModel'
 anthropic_claude_3_5_sonnet_latest: 'BaseChatModel'
@@ -80,9 +85,6 @@ anthropic_claude_3_5_haiku_latest: 'BaseChatModel'
 cerebras_gpt_oss_120b: 'BaseChatModel'
 cerebras_zai_glm_4_7: 'BaseChatModel'
 cerebras_gemma_4_31b: 'BaseChatModel'
-
-minimax_m3_1_flash: 'BaseChatModel'
-minimax_m3: 'BaseChatModel'
 
 bu_latest: 'BaseChatModel'
 bu_1_0: 'BaseChatModel'
@@ -168,6 +170,19 @@ def get_llm_by_name(model_name: str):
 	else:
 		model = model_part.replace('_', '-')
 
+	# Avian Models
+	if provider == 'avian':
+		api_key = os.getenv('AVIAN_API_KEY')
+		avian_model_map = {
+			'deepseek-v3-2': 'deepseek/deepseek-v3.2',
+			'kimi-k2-5': 'moonshotai/kimi-k2.5',
+			'glm-5': 'z-ai/glm-5',
+			'minimax-m2-5': 'minimax/minimax-m2.5',
+		}
+		normalized = model.replace('_', '-')
+		resolved_model = avian_model_map.get(normalized, model)
+		return ChatAvian(model=resolved_model, api_key=api_key)
+
 	# OpenAI Models
 	if provider == 'openai':
 		api_key = os.getenv('OPENAI_API_KEY')
@@ -217,13 +232,6 @@ def get_llm_by_name(model_name: str):
 		api_key = os.getenv('CEREBRAS_API_KEY')
 		return ChatCerebras(model=model, api_key=api_key)
 
-	# MiniMax Models
-	elif provider == 'minimax':
-		api_key = os.getenv('MINIMAX_API_KEY')
-		region = os.getenv('MINIMAX_REGION', 'global').lower()
-		minimax_map = {'m3-1-flash': 'MiniMax-M3.1-Flash', 'm3': 'MiniMax-M3', 'm2-7': 'MiniMax-M2.7'}
-		return ChatMiniMax(model=minimax_map.get(model, model_part), api_key=api_key, region=region)  # type: ignore[arg-type]
-
 	# Browser Use Models
 	elif provider == 'bu':
 		# Handle bu_latest -> bu-latest conversion (need to prepend 'bu-' back)
@@ -232,7 +240,7 @@ def get_llm_by_name(model_name: str):
 		return ChatBrowserUse(model=model, api_key=api_key)
 
 	else:
-		available_providers = ['openai', 'azure', 'google', 'anthropic', 'mistral', 'oci', 'cerebras', 'minimax', 'bu']
+		available_providers = ['avian', 'openai', 'azure', 'google', 'anthropic', 'mistral', 'oci', 'cerebras', 'bu']
 		raise ValueError(f"Unknown provider: '{provider}'. Available providers: {', '.join(available_providers)}")
 
 
@@ -240,7 +248,9 @@ def get_llm_by_name(model_name: str):
 def __getattr__(name: str) -> 'BaseChatModel':
 	"""Create model instances on demand with API keys from environment."""
 	# Handle chat classes first
-	if name == 'ChatOpenAI':
+	if name == 'ChatAvian':
+		return ChatAvian  # type: ignore
+	elif name == 'ChatOpenAI':
 		return ChatOpenAI  # type: ignore
 	elif name == 'ChatAzureOpenAI':
 		return ChatAzureOpenAI  # type: ignore
@@ -256,8 +266,6 @@ def __getattr__(name: str) -> 'BaseChatModel':
 		return ChatOCIRaw  # type: ignore
 	elif name == 'ChatCerebras':
 		return ChatCerebras  # type: ignore
-	elif name == 'ChatMiniMax':
-		return ChatMiniMax  # type: ignore
 	elif name == 'ChatBrowserUse':
 		return ChatBrowserUse  # type: ignore
 
@@ -270,12 +278,12 @@ def __getattr__(name: str) -> 'BaseChatModel':
 
 # Export all classes and preconfigured instances, conditionally including ChatOCIRaw
 __all__ = [
+	'ChatAvian',
 	'ChatOpenAI',
 	'ChatAzureOpenAI',
 	'ChatGoogle',
 	'ChatMistral',
 	'ChatCerebras',
-	'ChatMiniMax',
 	'ChatBrowserUse',
 ]
 
@@ -284,6 +292,11 @@ if OCI_AVAILABLE:
 
 __all__ += [
 	'get_llm_by_name',
+	# Avian instances - created on demand
+	'avian_deepseek_v3_2',
+	'avian_kimi_k2_5',
+	'avian_glm_5',
+	'avian_minimax_m2_5',
 	# OpenAI instances - created on demand
 	'openai_gpt_4o',
 	'openai_gpt_4o_mini',
@@ -331,9 +344,6 @@ __all__ += [
 	'cerebras_gpt_oss_120b',
 	'cerebras_zai_glm_4_7',
 	'cerebras_gemma_4_31b',
-	# MiniMax instances - created on demand
-	'minimax_m3_1_flash',
-	'minimax_m3',
 	# Browser Use instances - created on demand
 	'bu_latest',
 	'bu_1_0',
