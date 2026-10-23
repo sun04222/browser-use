@@ -1,18 +1,18 @@
-import asyncio
+import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeVar, overload
 
 import httpx
-from openai import APIConnectionError, APIStatusError, AsyncOpenAI, DefaultAsyncHttpxClient, RateLimitError, Timeout
+from openai import APIConnectionError, APIStatusError, AsyncOpenAI, RateLimitError
 from openai.types.chat import ChatCompletionContentPartTextParam
 from openai.types.chat.chat_completion import ChatCompletion
 from openai.types.shared.chat_model import ChatModel
 from openai.types.shared_params.reasoning_effort import ReasoningEffort
 from openai.types.shared_params.response_format_json_schema import JSONSchema, ResponseFormatJSONSchema
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from browser_use.llm.base import BaseChatModel, get_running_loop_or_none, is_reasoning_model
+from browser_use.llm.base import BaseChatModel, is_reasoning_model
 from browser_use.llm.exceptions import ModelOutputTruncatedError, ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.openai.serializer import OpenAIMessageSerializer
@@ -20,6 +20,26 @@ from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 
 T = TypeVar('T', bound=BaseModel)
+
+
+def _looks_like_json(text: str) -> bool:
+	"""Did the endpoint attempt JSON at all, or is this prose?
+
+	Two ways to count as an attempt: it opens an object or array, so the model was
+	producing JSON even if the reply is truncated, or it parses as a bare scalar
+	such as `123` or `"text"`, which is valid JSON in the wrong shape. Both are the
+	model's problem rather than the endpoint's, and must keep the original error.
+	"""
+	stripped = (text or '').strip()
+	if not stripped:
+		return False
+	if stripped.startswith(('{', '[')):
+		return True  # an attempt, even if truncated or malformed
+	try:
+		json.loads(stripped)
+	except ValueError:
+		return False
+	return True  # a bare scalar is valid JSON, just the wrong shape
 
 
 @dataclass
@@ -60,14 +80,8 @@ class ChatOpenAI(BaseChatModel):
 	max_retries: int = 5  # Increase default retries for automation reliability
 	default_headers: Mapping[str, str] | None = None
 	default_query: Mapping[str, object] | None = None
-	http_client: httpx.AsyncClient | DefaultAsyncHttpxClient | None = None
+	http_client: httpx.AsyncClient | None = None
 	_strict_response_validation: bool = False
-	# Internal client cache: SDK clients own an httpx connection pool, so share
-	# one client per chat instance instead of allocating a pool on every call.
-	_client: AsyncOpenAI | None = field(default=None, init=False, repr=False, compare=False)
-	# A pooled keep-alive connection belongs to the loop that opened it, so the cached
-	# client is only reusable while that loop is still the running one.
-	_client_loop: asyncio.AbstractEventLoop | None = field(default=None, init=False, repr=False, compare=False)
 	max_completion_tokens: int | None = 4096
 	reasoning_models: list[ChatModel | str] | None = field(
 		default_factory=lambda: [
@@ -80,7 +94,6 @@ class ChatOpenAI(BaseChatModel):
 			'gpt-5',
 			'gpt-5-mini',
 			'gpt-5-nano',
-			'gpt-6',
 		]
 	)
 
@@ -96,9 +109,9 @@ class ChatOpenAI(BaseChatModel):
 			'api_key': self.api_key,
 			'organization': self.organization,
 			'project': self.project,
-			'base_url': str(self.base_url) if self.base_url is not None else None,
-			'websocket_base_url': str(self.websocket_base_url) if self.websocket_base_url is not None else None,
-			'timeout': Timeout(**self.timeout.as_dict()) if isinstance(self.timeout, httpx.Timeout) else self.timeout,
+			'base_url': self.base_url,
+			'websocket_base_url': self.websocket_base_url,
+			'timeout': self.timeout,
 			'max_retries': self.max_retries,
 			'default_headers': self.default_headers,
 			'default_query': self.default_query,
@@ -116,18 +129,13 @@ class ChatOpenAI(BaseChatModel):
 
 	def get_client(self) -> AsyncOpenAI:
 		"""
-		Returns a cached AsyncOpenAI client.
+		Returns an AsyncOpenAI client.
 
 		Returns:
-			AsyncOpenAI: The shared AsyncOpenAI client for this chat instance.
+			AsyncOpenAI: An instance of the AsyncOpenAI client.
 		"""
-		loop = get_running_loop_or_none()
-		if self._client is None or self._client_loop is not loop:
-			# The old client's loop is already closed, so it cannot be awaited closed here.
-			client_params = self._get_client_params()
-			self._client = AsyncOpenAI(**client_params)
-			self._client_loop = loop
-		return self._client
+		client_params = self._get_client_params()
+		return AsyncOpenAI(**client_params)
 
 	@property
 	def name(self) -> str:
@@ -154,27 +162,6 @@ class ChatOpenAI(BaseChatModel):
 
 		return usage
 
-	def _get_model_params(self) -> dict[str, Any]:
-		"""Build request options for OpenAI and compatible providers."""
-		model_params: dict[str, Any] = {}
-		if self.temperature is not None:
-			model_params['temperature'] = self.temperature
-		if self.frequency_penalty is not None:
-			model_params['frequency_penalty'] = self.frequency_penalty
-		if self.max_completion_tokens is not None:
-			model_params['max_completion_tokens'] = self.max_completion_tokens
-		if self.top_p is not None:
-			model_params['top_p'] = self.top_p
-		if self.seed is not None:
-			model_params['seed'] = self.seed
-		if self.service_tier is not None:
-			model_params['service_tier'] = self.service_tier
-		if is_reasoning_model(self.model, self.reasoning_models):
-			model_params['reasoning_effort'] = self.reasoning_effort
-			model_params.pop('temperature', None)
-			model_params.pop('frequency_penalty', None)
-		return model_params
-
 	@overload
 	async def ainvoke(
 		self, messages: list[BaseMessage], output_format: None = None, **kwargs: Any
@@ -200,7 +187,30 @@ class ChatOpenAI(BaseChatModel):
 		openai_messages = OpenAIMessageSerializer.serialize_messages(messages)
 
 		try:
-			model_params = self._get_model_params()
+			model_params: dict[str, Any] = {}
+
+			if self.temperature is not None:
+				model_params['temperature'] = self.temperature
+
+			if self.frequency_penalty is not None:
+				model_params['frequency_penalty'] = self.frequency_penalty
+
+			if self.max_completion_tokens is not None:
+				model_params['max_completion_tokens'] = self.max_completion_tokens
+
+			if self.top_p is not None:
+				model_params['top_p'] = self.top_p
+
+			if self.seed is not None:
+				model_params['seed'] = self.seed
+
+			if self.service_tier is not None:
+				model_params['service_tier'] = self.service_tier
+
+			if is_reasoning_model(self.model, self.reasoning_models):
+				model_params['reasoning_effort'] = self.reasoning_effort
+				model_params.pop('temperature', None)
+				model_params.pop('frequency_penalty', None)
 
 			if output_format is None:
 				# Return string response
@@ -230,7 +240,6 @@ class ChatOpenAI(BaseChatModel):
 					completion=choice.message.content or '',
 					usage=usage,
 					stop_reason=choice.finish_reason,
-					thinking=getattr(choice.message, 'reasoning_content', None),
 				)
 
 			else:
@@ -310,13 +319,30 @@ class ChatOpenAI(BaseChatModel):
 
 				usage = self._get_usage(response)
 
-				parsed = output_format.model_validate_json(choice.message.content)
+				try:
+					parsed = output_format.model_validate_json(choice.message.content)
+				except ValidationError as e:
+					# A custom endpoint may accept response_format and ignore it, replying in
+					# prose. Pydantic then only reports that the JSON is invalid, which points
+					# at the model rather than at the endpoint that dropped the schema.
+					if self.base_url and not _looks_like_json(choice.message.content):
+						raise ModelProviderError(
+							message=(
+								'Requested structured output but the response was not JSON. The '
+								f'endpoint at {self.base_url} may not support '
+								'response_format=json_schema; many OpenAI-compatible servers accept '
+								'the field and ignore it. Try '
+								'ChatOpenAI(..., add_schema_to_system_prompt=True). '
+								f'Response began: {choice.message.content.strip()[:120]!r}'
+							),
+							model=self.name,
+						) from e
+					raise
 
 				return ChatInvokeCompletion(
 					completion=parsed,
 					usage=usage,
 					stop_reason=choice.finish_reason,
-					thinking=getattr(choice.message, 'reasoning_content', None),
 				)
 
 		except ModelProviderError:
