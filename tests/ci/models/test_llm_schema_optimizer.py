@@ -6,6 +6,7 @@ optimizes the schemas for agent actions without losing information.
 from pydantic import BaseModel, Field
 
 from browser_use.agent.views import AgentOutput
+from browser_use.llm.mistral.schema import MistralSchemaOptimizer
 from browser_use.llm.schema import SchemaOptimizer
 from browser_use.tools.service import Tools
 
@@ -208,3 +209,36 @@ def test_remove_flags_keep_fields_named_after_removed_keywords():
 		assert field_name in schema['required'], f'field {field_name!r} lost from required'
 	# default *values* are still stripped from annotations
 	assert 'default' not in props['other']
+def test_mistral_schema_preserves_property_names_matching_unsupported_keywords():
+	"""Mistral sanitization must distinguish model fields from schema constraints."""
+
+	class KeywordFields(BaseModel):
+		pattern: str
+		format: str
+		minimum_length: str = Field(alias='minLength')
+		maximum_length: str = Field(alias='maxLength')
+		code: str = Field(min_length=2, max_length=4, pattern='[A-Z]+')
+		email: str = Field(json_schema_extra={'format': 'email'})
+
+	class NestedModel(BaseModel):
+		properties: KeywordFields
+
+	schema = MistralSchemaOptimizer.create_mistral_compatible_schema(NestedModel)
+	keyword_schema = schema['properties']['properties']
+
+	assert MistralSchemaOptimizer.UNSUPPORTED_KEYWORDS.issubset(keyword_schema['properties'])
+	assert MistralSchemaOptimizer.UNSUPPORTED_KEYWORDS.issubset(keyword_schema['required'])
+	assert 'minLength' not in keyword_schema['properties']['code']
+	assert 'maxLength' not in keyword_schema['properties']['code']
+	assert 'pattern' not in keyword_schema['properties']['code']
+	assert 'format' not in keyword_schema['properties']['email']
+
+
+def test_mistral_schema_preserves_search_page_pattern_parameter():
+	"""The default search action must remain callable by Mistral models."""
+	from browser_use.tools.views import SearchPageAction
+
+	schema = MistralSchemaOptimizer.create_mistral_compatible_schema(SearchPageAction)
+
+	assert 'pattern' in schema['properties']
+	assert 'pattern' in schema['required']
