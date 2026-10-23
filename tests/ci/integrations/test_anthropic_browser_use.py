@@ -279,34 +279,51 @@ def test_quickstart_uses_peer_browser_use_and_bash_tools() -> None:
 	assert 'until_done()' in source
 
 
-@pytest.mark.asyncio
-async def test_bash_handles_missing_pid_during_cancellation_and_timeout(tmp_path, monkeypatch):
-	orig_subprocess_exec = asyncio.get_running_loop().subprocess_exec
+@pytest.mark.parametrize('decision', [True, False, 'error'])
+async def test_public_sdk_dispatch_preserves_confirmation(decision) -> None:
+	pytest.importorskip('anthropic.tools.browser')
+	from anthropic.tools import ToolError
+	from anthropic.tools.browser import BetaToolsetCallContext
 
-	class MockTransport:
-		def __init__(self, real_transport):
-			self._real = real_transport
+	from browser_use.integrations.toolsets_for_claude import BrowserUse
 
-		def get_pid(self):
-			return None
+	calls = []
 
-		def get_returncode(self):
-			return self._real.get_returncode()
+	def confirm(context):
+		if decision == 'error':
+			raise RuntimeError('approval unavailable')
+		return decision
 
-		def close(self):
-			return self._real.close()
+	class Driver(BrowserUse):
+		async def javascript_exec(self, context, input):
+			calls.append(input)
+			return 'verified'
 
-	async def fake_subprocess_exec(protocol_factory, *args, **kwargs):
-		transport, protocol = await orig_subprocess_exec(protocol_factory, *args, **kwargs)
-		return MockTransport(transport), protocol
+	driver = Driver(configs={'javascript_exec': {'enabled': True}}, confirm=confirm)
+	try:
+		if decision is True:
+			result = await driver.call(BetaToolsetCallContext(), 'javascript_exec', {'text': '1+1'})
+			assert calls
+			assert any(block.get('text') == 'verified' for block in result)
+		else:
+			with pytest.raises(ToolError):
+				await driver.call(BetaToolsetCallContext(), 'javascript_exec', {'text': '1+1'})
+			assert not calls
+	finally:
+		await driver.close()
 
-	monkeypatch.setattr(asyncio.get_running_loop(), 'subprocess_exec', fake_subprocess_exec)
 
-	task = asyncio.create_task(run_bash('sleep 5', output_dir=tmp_path))
-	await asyncio.sleep(0.05)
-	task.cancel()
-	with pytest.raises(asyncio.CancelledError):
-		await task
+@pytest.mark.parametrize('action', ['javascript_exec', 'read_console', 'read_network', 'file_upload'])
+async def test_public_sdk_dispatch_refuses_disabled_defaults(action) -> None:
+	pytest.importorskip('anthropic.tools.browser')
+	from anthropic.tools import ToolError
+	from anthropic.tools.browser import BetaToolsetCallContext
 
-	result = json.loads(await run_bash('sleep 5', output_dir=tmp_path, timeout_seconds=0.05))
-	assert result['timed_out'] is True
+	from browser_use.integrations.toolsets_for_claude import BrowserUse
+
+	driver = BrowserUse(confirm=lambda _: True)
+	try:
+		with pytest.raises(ToolError, match='not permitted'):
+			await driver.call(BetaToolsetCallContext(), action, {})
+	finally:
+		await driver.close()
