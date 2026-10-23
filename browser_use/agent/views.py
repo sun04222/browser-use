@@ -397,7 +397,7 @@ class AgentOutput(BaseModel):
 	plan_update: list[str] | None = None
 	action: list[ActionModel] = Field(
 		...,
-		json_schema_extra={'min_items': 1},  # Ensure at least one action is provided
+		json_schema_extra={'minItems': 1},  # Ensure at least one action is provided
 	)
 
 	@classmethod
@@ -425,7 +425,7 @@ class AgentOutput(BaseModel):
 			__base__=AgentOutput,
 			action=(
 				list[custom_actions],  # type: ignore
-				Field(..., description='List of actions to execute', json_schema_extra={'min_items': 1}),
+				Field(..., description='List of actions to execute', json_schema_extra={'minItems': 1}),
 			),
 			__module__=AgentOutput.__module__,
 		)
@@ -448,7 +448,7 @@ class AgentOutput(BaseModel):
 			__base__=AgentOutputNoThinking,
 			action=(
 				list[custom_actions],  # type: ignore
-				Field(..., json_schema_extra={'min_items': 1}),
+				Field(..., json_schema_extra={'minItems': 1}),
 			),
 			__module__=AgentOutputNoThinking.__module__,
 		)
@@ -478,7 +478,7 @@ class AgentOutput(BaseModel):
 			__base__=AgentOutputFlashMode,
 			action=(
 				list[custom_actions],  # type: ignore
-				Field(..., json_schema_extra={'min_items': 1}),
+				Field(..., json_schema_extra={'minItems': 1}),
 			),
 			__module__=AgentOutputFlashMode.__module__,
 		)
