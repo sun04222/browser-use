@@ -1,7 +1,6 @@
 """Security watchdog for enforcing URL access policies."""
 
 from typing import TYPE_CHECKING, ClassVar
-from urllib.parse import urlparse
 
 from bubus import BaseEvent
 
@@ -19,37 +18,14 @@ if TYPE_CHECKING:
 # Track if we've shown the glob warning
 _GLOB_WARNING_SHOWN = False
 
+# Schemes the WHATWG URL parser handles as "special". For these, a backslash is
+# treated as a slash and ASCII tab / line feed / carriage return are stripped
+# from the input before parsing.
+_SPECIAL_SCHEMES = frozenset({'http', 'https', 'ws', 'wss', 'ftp'})
 
-# URL schemes belonging to the host application, not to web content.
-# Electron apps expose their UI (tab strip, settings, etc.) as file:// page
-# targets; browsers expose chrome:// pages. Closing these targets can destroy
-# the host application, so the watchdog must ignore them, never enforce
-# domain policy on them.
-_HOST_APP_SCHEMES = frozenset(
-	{
-		'file',
-		'chrome',
-		'chrome-extension',
-		'chrome-untrusted',
-		'devtools',
-		'moz-extension',
-		'edge',
-		'opera',
-		'vivaldi',
-		'brave',
-	}
-)
-
-
-def _is_host_app_url(url: str) -> bool:
-	"""True for host-application pages (Electron chrome, browser-internal pages).
-
-	These are never closed or redirected by this watchdog. Agent-initiated
-	navigation is still gated separately in on_NavigateToUrlEvent.
-	"""
-	from urllib.parse import urlparse
-
-	return urlparse(url or '').scheme in _HOST_APP_SCHEMES
+# Default port per scheme. An explicitly written default port addresses the same
+# endpoint as an omitted one, so both spellings have to compare equal.
+_DEFAULT_PORTS = {'http': 80, 'https': 443, 'ws': 80, 'wss': 443, 'ftp': 21}
 
 
 class SecurityWatchdog(BaseWatchdog):
@@ -82,10 +58,6 @@ class SecurityWatchdog(BaseWatchdog):
 
 	async def on_NavigationCompleteEvent(self, event: NavigationCompleteEvent) -> None:
 		"""Check if navigated URL is allowed (catches redirects to blocked domains)."""
-		# Host-application pages (Electron chrome, browser-internal pages) must
-		# never be redirected to about:blank — that would destroy the host UI.
-		if _is_host_app_url(event.url):
-			return
 		# Check if the navigated URL is allowed (in case of redirects)
 		if not self._is_url_allowed(event.url):
 			self.logger.warning(f'⛔️ Navigation to non-allowed URL detected: {event.url}')
@@ -109,11 +81,6 @@ class SecurityWatchdog(BaseWatchdog):
 
 	async def on_TabCreatedEvent(self, event: TabCreatedEvent) -> None:
 		"""Check if new tab URL is allowed."""
-		# Host-application pages (Electron chrome, browser-internal pages) are
-		# not agent content: never close them, never error on them.
-		if _is_host_app_url(event.url):
-			self.logger.debug(f'Ignoring host-application page target: {event.url}')
-			return
 		if not self._is_url_allowed(event.url):
 			self.logger.warning(f'⛔️ New tab created with disallowed URL: {event.url}')
 
@@ -215,6 +182,24 @@ class SecurityWatchdog(BaseWatchdog):
 		except Exception:
 			return False
 
+	@staticmethod
+	def _canonicalize_url(url: str) -> str:
+		"""Spell a URL the way the browser will parse it.
+
+		Chromium runs the WHATWG URL parser, which for http(s) converts a
+		backslash to a slash and drops tab / line feed / carriage return
+		characters.  `urllib.parse` does neither, so
+		`https://attacker.com\\@example.com/` is read here as host `example.com`
+		while the browser navigates to `attacker.com`.  Matching against the raw
+		string therefore compares a different endpoint than the one that gets
+		visited.
+		"""
+		scheme, separator, _ = url.partition(':')
+		if not separator or scheme.lower() not in _SPECIAL_SCHEMES:
+			return url
+
+		return url.replace('\\', '/').replace('	', '').replace('\n', '').replace('\r', '')
+
 	def _is_url_allowed(self, url: str) -> bool:
 		"""Check if a URL is allowed based on the allowed_domains configuration.
 
@@ -226,10 +211,14 @@ class SecurityWatchdog(BaseWatchdog):
 		"""
 
 		# Always allow internal browser targets (before any other checks)
-		from browser_use.utils import is_new_tab_page
-
-		if is_new_tab_page(url):
+		if url in ['about:blank', 'chrome://new-tab-page/', 'chrome://new-tab-page', 'chrome://newtab/']:
 			return True
+
+		# Parse the URL the way the browser will. Chromium normalizes a
+		# backslash to a slash and drops tab / line feed / carriage return, so
+		# reading the raw string can describe a different endpoint than the one
+		# that gets visited.
+		url = self._canonicalize_url(url)
 
 		# Parse the URL to extract components
 		from urllib.parse import urlparse
@@ -326,19 +315,66 @@ class SecurityWatchdog(BaseWatchdog):
 		else:
 			# Exact match
 			if '://' in pattern:
-				# Full URL patterns must match the parsed origin, not a raw string prefix.
-				parsed_url = urlparse(url)
-				parsed_pattern = urlparse(pattern)
-				if parsed_url.scheme.lower() != parsed_pattern.scheme.lower():
-					return False
-				if parsed_url.netloc.lower() != parsed_pattern.netloc.lower():
-					return False
+				# Full URL pattern — parse both to avoid subdomain/port/userinfo bypass.
+				# url.startswith("https://example.com") would match
+				# "https://example.com.attacker.com" (subdomain bypass),
+				# "https://example.com:8080" (port bypass), and
+				# "https://example.com@attacker.com" (userinfo bypass).
+				from urllib.parse import urlparse as _urlparse
 
-				pattern_path = parsed_pattern.path.rstrip('/')
-				if not pattern_path:
-					return True
-				url_path = parsed_url.path.rstrip('/')
-				return url_path == pattern_path or url_path.startswith(f'{pattern_path}/')
+				try:
+					pat_parsed = _urlparse(pattern)
+				except Exception:
+					return False
+				pat_host = (pat_parsed.hostname or '').lower()
+				pat_path = pat_parsed.path.rstrip('/')
+				pat_scheme = (pat_parsed.scheme or '').lower()
+
+				if scheme != pat_scheme or host.lower() != pat_host:
+					return False
+				# Compare effective ports, not whether a port was written out.
+				# `https://example.com:443` and `https://example.com` are the
+				# same endpoint, so the two spellings must compare equal —
+				# otherwise a prohibited pattern is sidestepped by spelling out
+				# its default port.  A different port is a different service
+				# and still does not match.
+				try:
+					pat_port = pat_parsed.port  # None when not explicitly specified
+					url_port = _urlparse(url).port
+				except ValueError:
+					# urllib raises on non-numeric (`:abc`) and out-of-range
+					# (`:99999`) ports instead of returning None.  Returning no
+					# match keeps that URL out of the allowlist; letting the
+					# error escape would abort the navigation handler before it
+					# emits `BrowserErrorEvent`.
+					return False
+				pat_port = pat_port if pat_port is not None else _DEFAULT_PORTS.get(pat_scheme)
+				url_port = url_port if url_port is not None else _DEFAULT_PORTS.get(pat_scheme)
+				if pat_port != url_port:
+					return False
+				# If the pattern specifies a path prefix, enforce it.
+				# Use boundary-aware comparison: the URL path must either
+				# equal the pattern path exactly, or start with it followed
+				# by '/' or '?' to prevent sibling-path overmatch
+				# (e.g., pattern '/api' must not match '/apiary').
+				# Also preserve query/fragment constraints from the pattern.
+				if pat_path:
+					url_parsed = _urlparse(url)
+					url_path = url_parsed.path.rstrip('/')
+					if url_path == pat_path:
+						pass  # exact path match
+					elif url_path.startswith(pat_path + '/'):
+						pass  # sub-path match
+					else:
+						return False
+					# If the pattern includes query params, enforce them.
+					if pat_parsed.query:
+						if url_parsed.query != pat_parsed.query:
+							return False
+					if pat_parsed.fragment:
+						if url_parsed.fragment != pat_parsed.fragment:
+							return False
+				return True
 			else:
 				# Domain-only pattern (case-insensitive comparison)
 				if host.lower() == pattern.lower():
