@@ -1,10 +1,13 @@
 import asyncio
-import base64
+import inspect
 import json
 import logging
 import math
 import os
-from typing import TypeVar
+from collections.abc import Awaitable, Callable
+from typing import Any, Generic, TypeVar
+
+import anyio
 
 try:
 	from lmnr import Laminar  # type: ignore
@@ -30,7 +33,7 @@ from browser_use.browser.events import (
 )
 from browser_use.browser.views import BrowserError
 from browser_use.dom.service import EnhancedDOMTreeNode
-from browser_use.filesystem.file_system import FileSystem, RawPdfFile
+from browser_use.filesystem.file_system import FileSystem
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.messages import SystemMessage, UserMessage
 from browser_use.observability import observe_debug
@@ -68,6 +71,8 @@ ClickElementEvent.model_rebuild()
 TypeTextEvent.model_rebuild()
 ScrollEvent.model_rebuild()
 UploadFileEvent.model_rebuild()
+
+Context = TypeVar('Context')
 
 T = TypeVar('T', bound=BaseModel)
 
@@ -435,15 +440,17 @@ def _is_autocomplete_field(node: EnhancedDOMTreeNode) -> bool:
 	return False
 
 
-class Tools:
+class Tools(Generic[Context]):
 	def __init__(
 		self,
 		exclude_actions: list[str] | None = None,
 		output_model: type[T] | None = None,
 		display_files_in_done_text: bool = True,
+		before_action: Callable[[str, dict[str, Any]], Awaitable[ActionResult | None] | ActionResult | None] | None = None,
 	):
-		self.registry = Registry(exclude_actions if exclude_actions is not None else [])
+		self.registry = Registry[Context](exclude_actions if exclude_actions is not None else [])
 		self.display_files_in_done_text = display_files_in_done_text
+		self.before_action = before_action
 		self._output_model: type[BaseModel] | None = output_model
 		self._coordinate_clicking_enabled: bool = False
 
@@ -493,9 +500,8 @@ class Tools:
 				logger.info(msg)
 				return ActionResult(extracted_content=memory, long_term_memory=memory)
 			except Exception as e:
-				error_msg = str(e) or type(e).__name__
-				logger.error(f'Failed to search {params.engine}: {error_msg}')
-				return ActionResult(error=f'Failed to search {params.engine} for "{params.query}": {error_msg}')
+				logger.error(f'Failed to search {params.engine}: {e}')
+				return ActionResult(error=f'Failed to search {params.engine} for "{params.query}": {str(e)}')
 
 		@self.registry.action(
 			'',
@@ -551,7 +557,7 @@ class Tools:
 				logger.info(msg)
 				return ActionResult(extracted_content=msg, long_term_memory=memory)
 			except Exception as e:
-				error_msg = str(e) or type(e).__name__
+				error_msg = str(e)
 				# Always log the actual error first for debugging
 				browser_session.logger.error(f'❌ Navigation failed: {error_msg}')
 
@@ -576,22 +582,20 @@ class Tools:
 					return ActionResult(error=site_unavailable_msg)
 				else:
 					# Return error in ActionResult instead of re-raising
-					return ActionResult(error=f'Navigation failed: {error_msg}')
+					return ActionResult(error=f'Navigation failed: {str(e)}')
 
 		@self.registry.action('Go back', param_model=NoParamsAction, terminates_sequence=True)
 		async def go_back(_: NoParamsAction, browser_session: BrowserSession):
 			try:
 				event = browser_session.event_bus.dispatch(GoBackEvent())
-				did_navigate = await event.event_result(raise_if_any=True, raise_if_none=True)
-				if not did_navigate:
-					return ActionResult(error='Cannot go back - no previous entry in history')
+				await event
 				memory = 'Navigated back'
 				msg = f'🔙  {memory}'
 				logger.info(msg)
 				return ActionResult(extracted_content=memory)
 			except Exception as e:
 				logger.error(f'Failed to dispatch GoBackEvent: {type(e).__name__}: {e}')
-				error_msg = f'Failed to go back: {str(e) or type(e).__name__}'
+				error_msg = f'Failed to go back: {str(e)}'
 				return ActionResult(error=error_msg)
 
 		@self.registry.action('Wait for x seconds.')
@@ -645,10 +649,8 @@ class Tools:
 					try:
 						switch_event = browser_session.event_bus.dispatch(SwitchTabEvent(target_id=new_tab.target_id))
 						await switch_event
-						switched_target_id = await switch_event.event_result(raise_if_any=True, raise_if_none=False)
-						if switched_target_id == new_tab.target_id:
-							return f'. Automatically switched to new tab (tab_id: {new_tab_id}).'
-						return f'. Note: This opened a new tab (tab_id: {new_tab_id}) - switch to it if you need to interact with the new page.'
+						await switch_event.event_result(raise_if_any=False, raise_if_none=False)
+						return f'. Automatically switched to new tab (tab_id: {new_tab_id}).'
 					except Exception:
 						return f'. Note: This opened a new tab (tab_id: {new_tab_id}) - switch to it if you need to interact with the new page.'
 			except Exception:
@@ -700,9 +702,7 @@ class Tools:
 			except BrowserError as e:
 				return handle_browser_error(e)
 			except Exception as e:
-				error_msg = (
-					f'Failed to click at coordinates ({params.coordinate_x}, {params.coordinate_y}): {str(e) or type(e).__name__}'
-				)
+				error_msg = f'Failed to click at coordinates ({params.coordinate_x}, {params.coordinate_y}): {e}'
 				return ActionResult(error=error_msg)
 
 		async def _click_by_index(
@@ -719,7 +719,7 @@ class Tools:
 				if node is None:
 					msg = f'Element index {params.index} not available - page may have changed. Try refreshing browser state.'
 					logger.warning(f'⚠️ {msg}')
-					return ActionResult(error=msg)
+					return ActionResult(extracted_content=msg)
 
 				# Get description of clicked element
 				element_desc = get_click_description(node)
@@ -765,7 +765,7 @@ class Tools:
 			except BrowserError as e:
 				return handle_browser_error(e)
 			except Exception as e:
-				error_msg = f'Failed to click element {params.index}: {str(e) or type(e).__name__}'
+				error_msg = f'Failed to click element {params.index}: {str(e)}'
 				return ActionResult(error=error_msg)
 
 		# Store click handlers for re-registration
@@ -858,7 +858,7 @@ class Tools:
 			except Exception as e:
 				# Log the full error for debugging
 				logger.error(f'Failed to dispatch TypeTextEvent: {type(e).__name__}: {e}')
-				error_msg = f'Failed to type text into element {params.index}: {str(e) or type(e).__name__}'
+				error_msg = f'Failed to type text into element {params.index}: {e}'
 				return ActionResult(error=error_msg)
 
 		@self.registry.action(
@@ -1001,7 +1001,7 @@ class Tools:
 				)
 			except Exception as e:
 				logger.error(f'Failed to upload file: {e}')
-				raise BrowserError(f'Failed to upload file: {str(e) or type(e).__name__}')
+				raise BrowserError(f'Failed to upload file: {e}')
 
 		# Tab Management Actions
 
@@ -1017,27 +1017,19 @@ class Tools:
 
 				event = browser_session.event_bus.dispatch(SwitchTabEvent(target_id=target_id))
 				await event
-				# raise_if_any=True so a handler failure surfaces its real cause here instead
-				# of silently becoming a "produced no result" below.
-				new_target_id = await event.event_result(raise_if_any=True, raise_if_none=False)
+				new_target_id = await event.event_result(raise_if_any=False, raise_if_none=False)  # Don't raise on errors
+
+				if new_target_id:
+					memory = f'Switched to tab #{new_target_id[-4:]}'
+				else:
+					memory = f'Switched to tab #{params.tab_id}'
+
+				logger.info(f'🔄  {memory}')
+				return ActionResult(extracted_content=memory, long_term_memory=memory)
 			except Exception as e:
-				logger.warning(f'Tab switch failed: {e}')
-				# Preserve the concrete cause (e.g. a stale tab_id) instead of a generic
-				# message, so the agent gets actionable failure info in both memories.
-				memory = f'Failed to switch to tab #{params.tab_id}: {str(e) or type(e).__name__}'
-				raise BrowserError(memory, short_term_memory=memory, long_term_memory=memory)
-
-			# on_SwitchTabEvent returns the newly focused TargetID on every success path, so a
-			# missing result (with no exception raised) means the handler still failed rather
-			# than having quietly succeeded.
-			if not new_target_id:
-				memory = f'Failed to switch to tab #{params.tab_id}: tab switch produced no result'
-				logger.warning(memory)
-				raise BrowserError(memory, short_term_memory=memory, long_term_memory=memory)
-
-			memory = f'Switched to tab #{new_target_id[-4:]}'
-			logger.info(f'🔄  {memory}')
-			return ActionResult(extracted_content=memory, long_term_memory=memory)
+				logger.warning(f'Tab switch may have failed: {e}')
+				memory = f'Attempted to switch to tab #{params.tab_id}'
+				return ActionResult(extracted_content=memory, long_term_memory=memory)
 
 		@self.registry.action(
 			'Close a tab by tab_id. Tab IDs are shown in browser state tabs list (last 4 chars of target_id). Use to clean up tabs you no longer need.',
@@ -1343,9 +1335,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			total = data.get('total', 0)
 			memory = f'Searched page for "{params.pattern}": {total} match{"es" if total != 1 else ""} found.'
 			logger.info(f'🔎 {memory}')
-			# The matches go to the next step's read_state; only the one-line summary stays in history.
-			# Without include_extracted_content_only_once the LLM would only ever see `memory`.
-			return ActionResult(extracted_content=formatted, long_term_memory=memory, include_extracted_content_only_once=True)
+			return ActionResult(extracted_content=formatted, long_term_memory=memory)
 
 		@self.registry.action(
 			"""Query DOM elements by CSS selector (like find). Zero LLM cost, instant. Returns matching elements with tag, text, and attributes. Use to explore page structure, count items, get links/attributes. Use attributes=["href","src"] to extract specific attributes.""",
@@ -1380,8 +1370,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			total = data.get('total', 0)
 			memory = f'Found {total} element{"s" if total != 1 else ""} matching "{params.selector}".'
 			logger.info(f'🔍 {memory}')
-			# Same as search_page: show the elements once in read_state, keep the summary in history.
-			return ActionResult(extracted_content=formatted, long_term_memory=memory, include_extracted_content_only_once=True)
+			return ActionResult(extracted_content=formatted, long_term_memory=memory)
 
 		@self.registry.action(
 			"""Scroll by pages. REQUIRED: down=True/False (True=scroll down, False=scroll up, default=True). Optional: pages=0.5-10.0 (default 1.0). Use index for scroll elements (dropdowns/custom UI). High pages (10) reaches bottom. Multi-page scrolls sequentially. Viewport-based height, fallback 1000px/page.""",
@@ -1504,7 +1493,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				return ActionResult(extracted_content=memory, long_term_memory=memory)
 			except Exception as e:
 				logger.error(f'Failed to dispatch SendKeysEvent: {type(e).__name__}: {e}')
-				error_msg = f'Failed to send keys: {str(e) or type(e).__name__}'
+				error_msg = f'Failed to send keys: {str(e)}'
 				return ActionResult(error=error_msg)
 
 		@self.registry.action('Scroll to text.')
@@ -1546,25 +1535,10 @@ You will be given a query and the markdown of a webpage that has been filtered t
 					file_name = f'{file_name}.png'
 				file_name = FileSystem.sanitize_filename(file_name)
 
-				# Handle duplicate filenames (same policy as save_as_pdf)
-				if (file_system.get_dir() / file_name).exists():
-					base, ext = os.path.splitext(file_name)
-					counter = 1
-					while (file_system.get_dir() / f'{base} ({counter}){ext}').exists():
-						counter += 1
-					file_name = f'{base} ({counter}){ext}'
-
 				screenshot_bytes = await browser_session.take_screenshot(full_page=False)
-				# Register through the FileSystem (mirrors write_file: validates the
-				# PNG magic and syncs to disk) so read_file / list_files / describe /
-				# upload_file / done(files_to_display=...) can resolve the screenshot.
-				# Writing the bytes directly left an orphan on disk that the registry
-				# never knew about — and that a FileSystem re-init wiped.
-				write_result = await file_system.write_file(file_name, base64.b64encode(screenshot_bytes).decode('utf-8'))
-				if file_name not in file_system.files:
-					return ActionResult(extracted_content=write_result, error=write_result)
-
 				file_path = file_system.get_dir() / file_name
+				file_path.write_bytes(screenshot_bytes)
+
 				result = f'Screenshot saved to {file_name}'
 				logger.info(f'📸 {result}. Full path: {file_path}')
 				return ActionResult(
@@ -1673,27 +1647,19 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				file_name = f'{file_name}.pdf'
 			file_name = FileSystem.sanitize_filename(file_name)
 
-			# Handle duplicate filenames — check both the registry and disk so the
-			# two sources of truth can never disagree
-			if file_name in file_system.files or (file_system.get_dir() / file_name).exists():
+			file_path = file_system.get_dir() / file_name
+			# Handle duplicate filenames
+			if file_path.exists():
 				base, ext = os.path.splitext(file_name)
 				counter = 1
-				while (
-					f'{base} ({counter}){ext}' in file_system.files
-					or (file_system.get_dir() / f'{base} ({counter}){ext}').exists()
-				):
+				while (file_system.get_dir() / f'{base} ({counter}){ext}').exists():
 					counter += 1
 				file_name = f'{base} ({counter}){ext}'
+				file_path = file_system.get_dir() / file_name
 
-			# Register through the FileSystem (validates the %PDF magic and syncs
-			# to disk) so read_file / list_files / describe / upload_file /
-			# done(files_to_display=...) can resolve the saved page. Writing the
-			# bytes directly left an orphan the registry never knew about.
-			file_obj = RawPdfFile(name=os.path.splitext(file_name)[0])
-			await file_obj.write(base64.b64encode(pdf_bytes).decode('utf-8'), file_system.get_dir())
-			file_system.files[file_name] = file_obj
+			async with await anyio.open_file(file_path, 'wb') as f:
+				await f.write(pdf_bytes)
 
-			file_path = file_system.get_dir() / file_name
 			file_size = file_path.stat().st_size
 			msg = f'Saved page as PDF: {file_name} ({file_size:,} bytes)'
 			logger.info(f'📄 {msg}. Full path: {file_path}')
@@ -1717,7 +1683,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			if node is None:
 				msg = f'Element index {params.index} not available - page may have changed. Try refreshing browser state.'
 				logger.warning(f'⚠️ {msg}')
-				return ActionResult(error=msg)
+				return ActionResult(extracted_content=msg)
 
 			# Dispatch GetDropdownOptionsEvent to the event handler
 
@@ -1745,7 +1711,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			if node is None:
 				msg = f'Element index {params.index} not available - page may have changed. Try refreshing browser state.'
 				logger.warning(f'⚠️ {msg}')
-				return ActionResult(error=msg)
+				return ActionResult(extracted_content=msg)
 
 			# Dispatch SelectDropdownOptionEvent to the event handler
 			from browser_use.browser.events import SelectDropdownOptionEvent
@@ -1771,7 +1737,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				if 'short_term_memory' in selection_data and 'long_term_memory' in selection_data:
 					return ActionResult(
 						extracted_content=selection_data['short_term_memory'],
-						error=selection_data['long_term_memory'],
+						long_term_memory=selection_data['long_term_memory'],
 						include_extracted_content_only_once=True,
 					)
 				else:
@@ -1785,9 +1751,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			'Write content to a file. By default this OVERWRITES the entire file - use append=true to add to an existing file, or use replace_file for targeted edits within a file. '
 			'FILENAME RULES: Use only letters, numbers, underscores, hyphens, dots, parentheses. Spaces are auto-converted to hyphens. '
 			'SUPPORTED EXTENSIONS: .txt, .md, .json, .jsonl, .csv, .html, .xml, .pdf, .docx. '
-			'For small images (.png, .gif, .jpg, .jpeg, .webp) — e.g. a tiny file to upload — set content to the '
-			'base64 of a valid image (a 1x1 PNG is ~92 base64 chars); the bytes are decoded and written for you. '
-			'CANNOT write other binary files (.mp4, .zip, etc.) and do not attempt to save screenshots as files. '
+			'CANNOT write binary/image files (.png, .jpg, .mp4, etc.) - do not attempt to save screenshots as files. '
 			'For PDF files, write content in markdown format and it will be auto-converted to PDF.'
 		)
 		async def write_file(
@@ -2040,7 +2004,7 @@ Validated Code (after quote fixing):
 			self.display_files_in_done_text = display_files_in_done_text
 
 			@self.registry.action(
-				'Complete task with structured output. Set task_success to false if the user request is incomplete.',
+				'Complete task with structured output.',
 				param_model=StructuredOutputAction[output_model],
 			)
 			async def done(params: StructuredOutputAction, file_system: FileSystem, browser_session: BrowserSession):
@@ -2229,6 +2193,23 @@ Validated Code (after quote fixing):
 
 		for action_name, params in action.model_dump(exclude_unset=True).items():
 			if params is not None:
+				if self.before_action is not None:
+					try:
+						registered_action = self.registry.registry.actions[action_name]
+						effective_params = registered_action.param_model(**params).model_dump()
+						decision = self.before_action(action_name, effective_params)
+						if inspect.isawaitable(decision):
+							decision = await asyncio.wait_for(decision, timeout=timeout_s)
+						if isinstance(decision, ActionResult):
+							return decision
+						params = effective_params
+					except TimeoutError:
+						logger.error(f"Pre-action governance timed out for '{action_name}'")
+						return ActionResult(error=f'Action {action_name} rejected: pre-action governance timed out')
+					except Exception as e:
+						logger.error(f"Pre-action governance rejected '{action_name}': {e}")
+						return ActionResult(error=f'Action {action_name} rejected by pre-action governance: {e}')
+
 				# Use Laminar span if available, otherwise use no-op context manager
 				if Laminar is not None:
 					span_context = Laminar.start_as_current_span(
