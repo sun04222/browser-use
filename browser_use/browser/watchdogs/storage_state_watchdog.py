@@ -158,27 +158,18 @@ class StorageStateWatchdog(BaseWatchdog):
 	async def _save_storage_state(self, path: str | dict[str, Any] | None = None) -> None:
 		"""Save browser storage state to file."""
 		async with self._save_lock:
-			# Resolve the save target before touching CDP: stop()/kill() dispatch SaveStorageStateEvent
-			# even when no browser was ever connected (root CDP client is None), and creating a CDP
-			# session would assert-fail in that case (#6005).
 			save_path = path or self.browser_session.browser_profile.storage_state
 			if not save_path:
 				return
-
-			# Check if a browser connection exists; without one there is no state to save,
-			# and get_or_create_cdp_session would assert-fail (#6005). Use the underlying
-			# attribute / is_cdp_connected, NOT the `cdp_client` property, which itself
-			# raises AssertionError when the root CDP client is unset.
-			if not self.browser_session.is_cdp_connected:
-				self.logger.debug('[StorageStateWatchdog] No CDP client available, skipping storage state save')
-				return
-			assert await self.browser_session.get_or_create_cdp_session(target_id=None)
 
 			# Skip saving if the storage state is already a dict (indicates it was loaded from memory)
 			# We only save to file if it started as a file path
 			if isinstance(save_path, dict):
 				self.logger.debug('[StorageStateWatchdog] Storage state is already a dict, skipping file save')
 				return
+
+			# Only acquire CDP when a file destination requires saving browser state.
+			assert await self.browser_session.get_or_create_cdp_session(target_id=None)
 
 			try:
 				# Get current storage state using CDP
