@@ -190,3 +190,21 @@ def test_openai_strict_schema_keeps_all_fields_required():
 	schema = SchemaOptimizer.create_optimized_json_schema(ProductInfo)
 
 	assert set(schema['required']) == {'price', 'title', 'rating'}
+def test_remove_flags_keep_fields_named_after_removed_keywords():
+	"""remove_defaults/remove_min_items must not drop user fields whose names
+	match the keywords being stripped from schema annotations (#5829)."""
+
+	class Model(BaseModel):
+		default: str
+		minItems: str
+		min_items: str
+		other: str = Field(default='x')
+
+	schema = SchemaOptimizer.create_optimized_json_schema(Model, remove_defaults=True, remove_min_items=True)
+
+	props = schema['properties']
+	for field_name in ('default', 'minItems', 'min_items'):
+		assert field_name in props, f'field {field_name!r} was dropped from properties'
+		assert field_name in schema['required'], f'field {field_name!r} lost from required'
+	# default *values* are still stripped from annotations
+	assert 'default' not in props['other']
