@@ -3,7 +3,6 @@
 import asyncio
 import json
 import os
-from typing import Literal
 
 from cdp_use.cdp.input.commands import DispatchKeyEventParameters
 
@@ -37,27 +36,6 @@ SelectDropdownOptionEvent.model_rebuild()
 TypeTextEvent.model_rebuild()
 ScrollEvent.model_rebuild()
 UploadFileEvent.model_rebuild()
-
-# Text a named key types, sent on its keyDown as Puppeteer does. Chrome inserts a character only
-# when the keyDown carries `text` (without it Shift+Enter adds no newline), and drops it when the
-# page prevents the keydown's default (a separate char event would still insert it) or when
-# Control, Alt or Meta is held.
-_KEY_TEXT = {'Enter': '\r'}
-
-
-def _direction_to_deltas(direction: str, amount: int) -> tuple[int, int]:
-	"""Map a ScrollEvent direction to pixel deltas.
-
-	mouseWheel convention: deltaY positive = down, deltaX positive = right.
-	"""
-	if direction == 'down':
-		return 0, amount
-	if direction == 'up':
-		return 0, -amount
-	if direction == 'right':
-		return amount, 0
-	# 'left'
-	return -amount, 0
 
 
 class DefaultActionWatchdog(BaseWatchdog):
@@ -421,7 +399,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 			if event.force:
 				self.logger.debug(f'Force clicking at coordinates ({event.coordinate_x}, {event.coordinate_y})')
 				return await self._execute_click_with_download_detection(
-					self._click_on_coordinate(event.coordinate_x, event.coordinate_y, force=True, button=event.button)
+					self._click_on_coordinate(event.coordinate_x, event.coordinate_y, force=True)
 				)
 
 			# Get element at coordinates for safety checks
@@ -432,7 +410,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 					f'No element found at coordinates ({event.coordinate_x}, {event.coordinate_y}), proceeding with click anyway'
 				)
 				return await self._execute_click_with_download_detection(
-					self._click_on_coordinate(event.coordinate_x, event.coordinate_y, force=False, button=event.button)
+					self._click_on_coordinate(event.coordinate_x, event.coordinate_y, force=False)
 				)
 
 			# Safety check: file input
@@ -464,7 +442,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 
 			# All safety checks passed, click at coordinates (with download detection)
 			return await self._execute_click_with_download_detection(
-				self._click_on_coordinate(event.coordinate_x, event.coordinate_y, force=False, button=event.button)
+				self._click_on_coordinate(event.coordinate_x, event.coordinate_y, force=False)
 			)
 
 		except Exception:
@@ -545,9 +523,9 @@ class DefaultActionWatchdog(BaseWatchdog):
 				if self.browser_session._dom_watchdog:
 					self.browser_session._dom_watchdog.clear_cache()
 
-			# Convert direction and amount to pixel deltas.
-			# mouseWheel convention: deltaY positive = down, deltaX positive = right.
-			delta_x, delta_y = _direction_to_deltas(event.direction, event.amount)
+			# Convert direction and amount to pixels
+			# Positive pixels = scroll down, negative = scroll up
+			pixels = event.amount if event.direction == 'down' else -event.amount
 
 			# Element-specific scrolling if node is provided
 			if event.node is not None:
@@ -558,7 +536,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 				is_iframe = element_node.tag_name and element_node.tag_name.upper() == 'IFRAME'
 
 				# Try to scroll the element's container
-				success = await self._scroll_element_container(element_node, delta_x, delta_y)
+				success = await self._scroll_element_container(element_node, pixels)
 				if success:
 					self.logger.debug(
 						f'📜 Scrolled element {index_for_logging} container {event.direction} by {event.amount} pixels'
@@ -578,7 +556,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 					return None
 
 			# Perform target-level scroll
-			await self._scroll_with_cdp_gesture(delta_x, delta_y)
+			await self._scroll_with_cdp_gesture(pixels)
 
 			# Note: We don't clear cached state here - let multi_act handle DOM change detection
 			# by explicitly rebuilding and comparing when needed
@@ -1083,9 +1061,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 				long_term_memory=error_detail,
 			)
 
-	async def _click_on_coordinate(
-		self, coordinate_x: int, coordinate_y: int, force: bool = False, button: Literal['left', 'right', 'middle'] = 'left'
-	) -> dict | None:
+	async def _click_on_coordinate(self, coordinate_x: int, coordinate_y: int, force: bool = False) -> dict | None:
 		"""
 		Click directly at coordinates using CDP Input.dispatchMouseEvent.
 
@@ -1124,7 +1100,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 							'type': 'mousePressed',
 							'x': coordinate_x,
 							'y': coordinate_y,
-							'button': button,
+							'button': 'left',
 							'clickCount': 1,
 						},
 						session_id=session_id,
@@ -1143,7 +1119,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 							'type': 'mouseReleased',
 							'x': coordinate_x,
 							'y': coordinate_y,
-							'button': button,
+							'button': 'left',
 							'clickCount': 1,
 						},
 						session_id=session_id,
@@ -2225,13 +2201,12 @@ class DefaultActionWatchdog(BaseWatchdog):
 			self.logger.warning(f'⚠️ Failed to trigger framework events: {type(e).__name__}: {e}')
 			# Don't raise - framework events are a best-effort enhancement
 
-	async def _scroll_with_cdp_gesture(self, delta_x: int, delta_y: int) -> bool:
+	async def _scroll_with_cdp_gesture(self, pixels: int) -> bool:
 		"""
 		Scroll using CDP Input.synthesizeScrollGesture to simulate realistic scroll gesture.
 
 		Args:
-			delta_x: Horizontal pixels to scroll (positive = right, negative = left)
-			delta_y: Vertical pixels to scroll (positive = down, negative = up)
+			pixels: Number of pixels to scroll (positive = down, negative = up)
 
 		Returns:
 			True if successful, False if failed
@@ -2255,25 +2230,23 @@ class DefaultActionWatchdog(BaseWatchdog):
 			center_x = viewport_width / 2
 			center_y = viewport_height / 2
 
-			# For scroll gestures both axes are inverted relative to the
-			# mouseWheel convention: positive yDistance scrolls up, positive
-			# xDistance scrolls left (see the same inversion in actor/mouse.py).
-			x_distance = -delta_x
-			y_distance = -delta_y
+			# For scroll gesture, positive yDistance scrolls up, negative scrolls down
+			# (opposite of mouseWheel deltaY convention)
+			y_distance = -pixels
 
 			# Synthesize scroll gesture - use very high speed for near-instant scrolling
 			await cdp_client.send.Input.synthesizeScrollGesture(
 				params={
 					'x': center_x,
 					'y': center_y,
-					'xDistance': x_distance,
+					'xDistance': 0,
 					'yDistance': y_distance,
 					'speed': 50000,  # pixels per second (high = near-instant scroll)
 				},
 				session_id=session_id,
 			)
 
-			self.logger.debug(f'📄 Scrolled via CDP gesture: dx={delta_x}px dy={delta_y}px')
+			self.logger.debug(f'📄 Scrolled via CDP gesture: {pixels}px')
 			return True
 
 		except Exception as e:
@@ -2281,7 +2254,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 			self.logger.debug(f'CDP gesture scroll failed ({type(e).__name__}: {e}), falling back to JS')
 			return False
 
-	async def _scroll_element_container(self, element_node, delta_x: int, delta_y: int) -> bool:
+	async def _scroll_element_container(self, element_node, pixels: int) -> bool:
 		"""Try to scroll an element's container using CDP."""
 		try:
 			cdp_session = await self.browser_session.cdp_client_for_node(element_node)
@@ -2311,19 +2284,16 @@ class DefaultActionWatchdog(BaseWatchdog):
 										if (doc) {{
 											const scrollElement = doc.documentElement || doc.body;
 											if (scrollElement) {{
-											const oldScrollTop = scrollElement.scrollTop;
-											const oldScrollLeft = scrollElement.scrollLeft;
-											scrollElement.scrollTop += {delta_y};
-											scrollElement.scrollLeft += {delta_x};
-											const newScrollTop = scrollElement.scrollTop;
-											const newScrollLeft = scrollElement.scrollLeft;
-											return {{
-												success: true,
-												oldScrollTop: oldScrollTop,
-												newScrollTop: newScrollTop,
-												scrolled: (newScrollTop - oldScrollTop) + (newScrollLeft - oldScrollLeft)
-											}};
-										}}
+												const oldScrollTop = scrollElement.scrollTop;
+												scrollElement.scrollTop += {pixels};
+												const newScrollTop = scrollElement.scrollTop;
+												return {{
+													success: true,
+													oldScrollTop: oldScrollTop,
+													newScrollTop: newScrollTop,
+													scrolled: newScrollTop - oldScrollTop
+												}};
+											}}
 										}}
 										return {{success: false, error: 'Could not access iframe content'}};
 									}} catch (e) {{
@@ -2363,8 +2333,8 @@ class DefaultActionWatchdog(BaseWatchdog):
 					'type': 'mouseWheel',
 					'x': center_x,
 					'y': center_y,
-					'deltaX': delta_x,
-					'deltaY': delta_y,
+					'deltaX': 0,
+					'deltaY': pixels,
 				},
 				session_id=cdp_session.session_id,
 			)
@@ -2488,9 +2458,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 		except Exception as e:
 			raise
 
-	async def _dispatch_key_event(
-		self, cdp_session, event_type: str, key: str, modifiers: int = 0, text: str | None = None
-	) -> None:
+	async def _dispatch_key_event(self, cdp_session, event_type: str, key: str, modifiers: int = 0) -> None:
 		"""Helper to dispatch a keyboard event with proper key codes."""
 		code, vk_code = get_key_info(key)
 		params: DispatchKeyEventParameters = {
@@ -2500,19 +2468,13 @@ class DefaultActionWatchdog(BaseWatchdog):
 		}
 		if modifiers:
 			params['modifiers'] = modifiers
-		if text is not None:
-			params['text'] = text
-			params['unmodifiedText'] = text
 		if vk_code is not None:
 			params['windowsVirtualKeyCode'] = vk_code
 		await cdp_session.cdp_client.send.Input.dispatchKeyEvent(params=params, session_id=cdp_session.session_id)
 
 	async def on_SendKeysEvent(self, event: SendKeysEvent) -> None:
 		"""Handle send keys request with CDP."""
-		if event.target_id is not None:
-			cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=event.target_id, focus=True)
-		else:
-			cdp_session = await self.browser_session.get_or_create_cdp_session(focus=True)
+		cdp_session = await self.browser_session.get_or_create_cdp_session(focus=True)
 		try:
 			# Normalize key names from common aliases
 			key_aliases = {
@@ -2547,6 +2509,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 			is_combination = False
 			modifiers = []
 			main_key = None
+			sent_enter = False
 			if '+' in keys and keys != '+':
 				if keys.endswith('++'):
 					prefix = keys[:-2]
@@ -2578,9 +2541,12 @@ class DefaultActionWatchdog(BaseWatchdog):
 					await self._dispatch_key_event(cdp_session, 'keyDown', mod)
 
 				# Press main key with modifiers bitmask
-				await self._dispatch_key_event(cdp_session, 'keyDown', main_key, modifier_value, _KEY_TEXT.get(main_key))
+				await self._dispatch_key_event(cdp_session, 'keyDown', main_key, modifier_value)
 
 				await self._dispatch_key_event(cdp_session, 'keyUp', main_key, modifier_value)
+
+				if main_key == 'Enter':
+					sent_enter = True
 
 				# Release modifier keys
 				for mod in reversed(modifiers):
@@ -2624,8 +2590,18 @@ class DefaultActionWatchdog(BaseWatchdog):
 
 				# If it's a special key, use original logic
 				if normalized_keys in special_keys:
-					# Enter's text on the keyDown also fires keypress listeners
-					await self._dispatch_key_event(cdp_session, 'keyDown', normalized_keys, text=_KEY_TEXT.get(normalized_keys))
+					await self._dispatch_key_event(cdp_session, 'keyDown', normalized_keys)
+					# For Enter key, also dispatch a char event to trigger keypress listeners
+					if normalized_keys == 'Enter':
+						await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
+							params={
+								'type': 'char',
+								'text': '\r',
+								'key': 'Enter',
+							},
+							session_id=cdp_session.session_id,
+						)
+						sent_enter = True
 					await self._dispatch_key_event(cdp_session, 'keyUp', normalized_keys)
 				else:
 					# It's text (single character or string) - send each character as text input
@@ -2660,6 +2636,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 								},
 								session_id=cdp_session.session_id,
 							)
+							sent_enter = True
 							continue
 
 						# Get proper modifiers and key info for the character
@@ -2707,7 +2684,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 
 			# Note: We don't clear cached state on Enter; multi_act will detect DOM changes
 			# and rebuild explicitly. We still wait briefly for potential navigation.
-			if 'enter' in event.keys.lower() or 'return' in event.keys.lower():
+			if sent_enter:
 				await asyncio.sleep(0.1)
 		except Exception as e:
 			raise
@@ -3349,19 +3326,6 @@ class DefaultActionWatchdog(BaseWatchdog):
 				function(targetText) {
 					const startElement = this;
 
-					// Disabled per native :disabled, aria-disabled, or the common .disabled class
-					function isDisabled(el) {
-						return el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true' || el.classList.contains('disabled');
-					}
-
-					// Options the agent can pick instead, reported with a disabled-option refusal
-					function enabledOptions(items) {
-						return Array.from(items)
-							.filter(item => !isDisabled(item))
-							.map(item => ({ text: item.textContent ? item.textContent.trim() : '', value: item.getAttribute('data-value') || '' }))
-							.filter(opt => opt.text || opt.value);
-					}
-
 					// Function to attempt selection on a dropdown element
 					function attemptSelection(element) {
 						// Handle native select elements
@@ -3441,10 +3405,6 @@ class DefaultActionWatchdog(BaseWatchdog):
 						// Handle ARIA dropdowns/menus
 						const role = element.getAttribute('role');
 						if (role === 'menu' || role === 'listbox' || role === 'combobox') {
-							if (isDisabled(element)) {
-								return { success: false, error: 'Dropdown is disabled and cannot be changed' };
-							}
-
 							const menuItems = element.querySelectorAll('[role="menuitem"], [role="option"]');
 							const targetTextLower = targetText.toLowerCase();
 
@@ -3455,18 +3415,20 @@ class DefaultActionWatchdog(BaseWatchdog):
 
 									// Match against both text and data-value (case-insensitive)
 									if (itemTextLower === targetTextLower || itemValueLower === targetTextLower) {
-										if (isDisabled(item)) {
-											return {
-												success: false,
-												error: `Menu item '${item.textContent.trim()}' is disabled and cannot be selected`,
-												optionDisabled: true,
-												availableOptions: enabledOptions(menuItems)
-											};
-										}
+										// Clear previous selections
+										menuItems.forEach(mi => {
+											mi.setAttribute('aria-selected', 'false');
+											mi.classList.remove('selected');
+										});
 
-										// Click exactly once and let the page own the selected state: pre-setting
-										// aria-selected/classes or clicking twice makes toggling options deselect themselves
+										// Select this item
+										item.setAttribute('aria-selected', 'true');
+										item.classList.add('selected');
+
+										// Trigger click and change events
 										item.click();
+										const clickEvent = new MouseEvent('click', { view: window, bubbles: true, cancelable: true });
+										item.dispatchEvent(clickEvent);
 
 										return {
 											success: true,
@@ -3491,10 +3453,6 @@ class DefaultActionWatchdog(BaseWatchdog):
 
 						// Handle Semantic UI or custom dropdowns
 						if (element.classList.contains('dropdown') || element.classList.contains('ui')) {
-							if (isDisabled(element)) {
-								return { success: false, error: 'Dropdown is disabled and cannot be changed' };
-							}
-
 							const menuItems = element.querySelectorAll('.item, .option, [data-value]');
 							const targetTextLower = targetText.toLowerCase();
 
@@ -3505,18 +3463,24 @@ class DefaultActionWatchdog(BaseWatchdog):
 
 									// Match against both text and data-value (case-insensitive)
 									if (itemTextLower === targetTextLower || itemValueLower === targetTextLower) {
-										if (isDisabled(item)) {
-											return {
-												success: false,
-												error: `Custom dropdown item '${item.textContent.trim()}' is disabled and cannot be selected`,
-												optionDisabled: true,
-												availableOptions: enabledOptions(menuItems)
-											};
+										// Clear previous selections
+										menuItems.forEach(mi => {
+											mi.classList.remove('selected', 'active');
+										});
+
+										// Select this item
+										item.classList.add('selected', 'active');
+
+										// Update dropdown text if there's a text element
+										const textElement = element.querySelector('.text');
+										if (textElement) {
+											textElement.textContent = item.textContent.trim();
 										}
 
-										// Click exactly once and let the dropdown's own handler update its classes and text:
-										// pre-setting them or clicking twice makes toggling items deselect themselves
+										// Trigger click and change events
 										item.click();
+										const clickEvent = new MouseEvent('click', { view: window, bubbles: true, cancelable: true });
+										item.dispatchEvent(clickEvent);
 
 										// Also dispatch on the main dropdown element
 										const dropdownChangeEvent = new Event('change', { bubbles: true });
@@ -3760,15 +3724,10 @@ class DefaultActionWatchdog(BaseWatchdog):
 								short_term_options.append(f'- {opt}')
 
 						if short_term_options:
-							if selection_result.get('optionDisabled'):
-								# Keep the refusal reason; the list only offers the enabled alternatives
-								short_term_memory = f'{error_msg}. Enabled options are:\n' + '\n'.join(short_term_options)
-								long_term_memory = error_msg
-							else:
-								short_term_memory = 'Available dropdown options  are:\n' + '\n'.join(short_term_options)
-								long_term_memory = (
-									f"Couldn't select the dropdown option as '{target_text}' is not one of the available options."
-								)
+							short_term_memory = 'Available dropdown options  are:\n' + '\n'.join(short_term_options)
+							long_term_memory = (
+								f"Couldn't select the dropdown option as '{target_text}' is not one of the available options."
+							)
 
 							# Return error result with structured memory instead of raising exception
 							return {
