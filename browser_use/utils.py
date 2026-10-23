@@ -76,24 +76,20 @@ def sanitize_url_candidate(url: str) -> str:
 	return candidate[:end]
 
 
-def split_trailing_wrapper_brackets(url: str) -> tuple[str, str]:
-	"""Split unbalanced trailing closing brackets off a URL match.
-
-	Markdown links like ``[label](url)`` let the link's closing ``)`` into
-	URL_PATTERN matches; a URL that opened the bracket itself
-	(``/wiki/Python_(programming_language)``) keeps it. Returns ``(url, tail)``
-	where ``tail`` must be re-appended after processing the URL.
-	"""
-	bracket_counts = {bracket: url.count(bracket) for bracket in '()[]'}
-	end = len(url)
-	while end:
-		last_char = url[end - 1]
-		opening_bracket = _CLOSING_TO_OPENING_BRACKET.get(last_char)
-		if opening_bracket is None or bracket_counts[last_char] <= bracket_counts[opening_bracket]:
-			break
-		bracket_counts[last_char] -= 1
-		end -= 1
-	return url[:end], url[end:]
+def http_hosts_match(url: str, current_url: str) -> bool:
+	"""Return True when both URLs are http(s) and share a host and port."""
+	try:
+		left = urlparse(url)
+		right = urlparse(current_url)
+		# .port raises ValueError for a port outside 0-65535 or one that is not a number
+		ports_match = left.port == right.port
+	except ValueError:
+		return False
+	if left.scheme.lower() not in ('http', 'https') or right.scheme.lower() not in ('http', 'https'):
+		return False
+	if not left.hostname or not right.hostname:
+		return False
+	return left.hostname.lower() == right.hostname.lower() and ports_match
 
 
 def has_url_negation(context: str) -> bool:
@@ -586,7 +582,7 @@ def match_url_with_domain_pattern(url: str, domain_pattern: str, log_warnings: b
 
 	Supports optional glob patterns and schemes:
 	- *.example.com will match sub.example.com and example.com
-	- *google.com is unsupported and will not match google.com, agoogle.com, or www.google.com
+	- *google.com will match google.com, agoogle.com, and www.google.com
 	- http*://example.com will match http://example.com, https://example.com
 	- chrome-extension://* will match chrome-extension://aaaaaaaaaaaa and chrome-extension://bbbbbbbbbbbbb
 
@@ -628,16 +624,8 @@ def match_url_with_domain_pattern(url: str, domain_pattern: str, log_warnings: b
 			pattern_domain = domain_pattern
 
 		# Handle port in pattern (we strip ports from patterns since we already
-		# extracted only the hostname from the URL). IPv6 literals are bracketed
-		# (`[::1]:3000`); split on the last colon so the brackets survive, then
-		# drop the brackets because urlparse's hostname has none — otherwise a
-		# literal IPv6 pattern can never match its own URL.
-		if pattern_domain.startswith('['):
-			if pattern_domain.endswith(']'):
-				pattern_domain = pattern_domain[1:-1]
-			elif ']:' in pattern_domain:
-				pattern_domain = pattern_domain.rsplit(':', 1)[0].strip('[]')
-		elif ':' in pattern_domain and not pattern_domain.startswith(':'):
+		# extracted only the hostname from the URL)
+		if ':' in pattern_domain and not pattern_domain.startswith(':'):
 			pattern_domain = pattern_domain.split(':', 1)[0]
 
 		# If scheme doesn't match, return False
