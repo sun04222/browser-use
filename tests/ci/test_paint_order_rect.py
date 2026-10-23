@@ -1,17 +1,9 @@
-<<<<<<< ours
-"""Regression tests for paint-order rectangle validation (#5987)."""
-
-=======
->>>>>>> theirs
 import pytest
 
 from browser_use.dom.serializer.paint_order import PaintOrderRemover, Rect
 from browser_use.dom.views import DOMRect, EnhancedDOMTreeNode, EnhancedSnapshotNode, NodeType, SimplifiedNode
 
 
-<<<<<<< ours
-def _make_snapshot(paint_order: int, bounds: DOMRect) -> EnhancedSnapshotNode:
-=======
 class TestRectValidation:
 	def test_valid_rect_initialization_and_area(self):
 		r = Rect(x1=10.0, y1=20.0, x2=50.0, y2=70.0)
@@ -40,28 +32,19 @@ class TestRectValidation:
 
 
 def _make_snapshot_node(paint_order: int, bounds: DOMRect) -> EnhancedSnapshotNode:
->>>>>>> theirs
 	return EnhancedSnapshotNode(
 		is_clickable=None,
 		cursor_style=None,
 		bounds=bounds,
 		clientRects=None,
 		scrollRects=None,
-<<<<<<< ours
-		computed_styles={},
-=======
 		computed_styles={'opacity': '1.0', 'background-color': 'rgb(255, 255, 255)'},
->>>>>>> theirs
 		paint_order=paint_order,
 		stacking_contexts=None,
 	)
 
 
-<<<<<<< ours
-def _make_node(snapshot_node: EnhancedSnapshotNode) -> EnhancedDOMTreeNode:
-=======
 def _make_tree_node(snapshot_node: EnhancedSnapshotNode | None) -> EnhancedDOMTreeNode:
->>>>>>> theirs
 	return EnhancedDOMTreeNode(
 		node_id=1,
 		backend_node_id=1,
@@ -85,37 +68,6 @@ def _make_tree_node(snapshot_node: EnhancedSnapshotNode | None) -> EnhancedDOMTr
 	)
 
 
-<<<<<<< ours
-class TestRectValidation:
-	def test_rect_rejects_inverted_x_bounds(self) -> None:
-		with pytest.raises(ValueError):
-			Rect(x1=100.0, y1=0.0, x2=20.0, y2=10.0)
-
-	def test_rect_rejects_inverted_y_bounds(self) -> None:
-		with pytest.raises(ValueError):
-			Rect(x1=0.0, y1=50.0, x2=100.0, y2=10.0)
-
-	def test_rect_allows_zero_width_and_height(self) -> None:
-		# x1 == x2 (or y1 == y2) is degenerate but not inverted; allowed here.
-		assert Rect(x1=10.0, y1=0.0, x2=10.0, y2=20.0).area() == 0.0
-		assert Rect(x1=0.0, y1=10.0, x2=20.0, y2=10.0).area() == 0.0
-
-
-class TestPaintOrderSkipsNonPositiveDimensions:
-	def test_zero_dimension_node_does_not_enter_occlusion(self) -> None:
-		"""A collapsed element (width 0) must be skipped, not fed to Rect."""
-		node = _make_node(_make_snapshot(paint_order=1, bounds=DOMRect(x=0, y=0, width=0, height=10)))
-		simplified = SimplifiedNode(original_node=node, children=[])
-		wrapper = SimplifiedNode(
-			original_node=_make_node(_make_snapshot(paint_order=2, bounds=DOMRect(x=0, y=0, width=100, height=100))),
-			children=[simplified],
-		)
-
-		# Should not raise and must not mark the collapsed node as occluded.
-		PaintOrderRemover(wrapper).calculate_paint_order()
-
-		assert simplified.ignored_by_paint_order is False
-=======
 class TestPaintOrderNonPositiveBounds:
 	def test_zero_and_negative_dimension_nodes_do_not_corrupt_occlusion(self):
 		"""
@@ -151,4 +103,3 @@ class TestPaintOrderNonPositiveBounds:
 
 		# Underneath node must NOT be marked ignored because the zero/negative nodes have no surface area
 		assert underneath_node.ignored_by_paint_order is False
->>>>>>> theirs
