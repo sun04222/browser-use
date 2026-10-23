@@ -108,11 +108,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-<<<<<<< ours
-See `models.md` for all 15+ providers.
-=======
 See `references/models.md` for all 15+ providers.
->>>>>>> theirs
 
 ---
 
@@ -146,10 +142,9 @@ async def stealth_task(browser: Browser):
 
 ### With Authentication (Profile Sync)
 
-1. Sync local cookies: set your API key, install [`profile-use`](https://github.com/browser-use/profile-use-releases/releases/latest), and follow the [profile sync guide](https://github.com/browser-use/browser-harness/blob/main/interaction-skills/profile-sync.md).
-
+1. Sync local cookies:
 ```bash
-export BROWSER_USE_API_KEY=your-key
+export BROWSER_USE_API_KEY=your_key && curl -fsSL https://browser-use.com/profile.sh | sh
 ```
 
 2. Use the returned profile_id:
