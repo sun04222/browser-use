@@ -23,23 +23,24 @@ from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 
 T = TypeVar('T', bound=BaseModel)
 
+# Gemini 3.x model ids, with an optional minor version: gemini-3-flash, gemini-3.1-pro, gemini-3.5-flash, ...
+_GEMINI_3_PRO_RE = re.compile(r'gemini-3(\.\d+)?-pro')
+_GEMINI_3_FLASH_RE = re.compile(r'gemini-3(\.\d+)?-flash')
 
 VerifiedGeminiModels = Literal[
+	'gemini-2.0-flash',
+	'gemini-2.0-flash-exp',
+	'gemini-2.0-flash-lite-preview-02-05',
+	'Gemini-2.0-exp',
 	'gemini-2.5-flash',
 	'gemini-2.5-flash-lite',
-	'gemini-2.5-pro',
-	'gemini-3-flash-preview',
-	'gemini-3.1-pro-preview',
-	'gemini-3.1-flash-lite',
-	'gemini-3.5-flash',
-	'gemini-3.5-flash-lite',
-	'gemini-3.6-flash',
-	'gemini-3.7-flash',
-	'gemini-3.8-flash',
-	'gemini-4-argon',
-	'gemini-pro-latest',
 	'gemini-flash-latest',
 	'gemini-flash-lite-latest',
+	'gemini-2.5-pro',
+	'gemini-3-pro-preview',
+	'gemini-3.1-pro-preview',
+	'gemini-3-flash-preview',
+	'gemini-3.1-flash-lite',
 	'gemma-3-27b-it',
 	'gemma-3-4b',
 	'gemma-3-12b',
@@ -78,7 +79,7 @@ class ChatGoogle(BaseChatModel):
 		from google.genai import types
 
 		llm = ChatGoogle(
-			model='gemini-3.8-flash',
+			model='gemini-2.0-flash-exp',
 			config={
 				'tools': [types.Tool(code_execution=types.ToolCodeExecution())]
 			},
@@ -270,18 +271,11 @@ class ChatGoogle(BaseChatModel):
 		if self.config:
 			config = self.config.copy()
 
-		if self.model in ('gemini-pro-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest'):
-			is_gemini_3_and_later = True
-		elif match := re.match(r'gemini-(\d+)', self.model):
-			is_gemini_3_and_later = int(match.group(1)) >= 3
-		else:
-			is_gemini_3_and_later = False
-
 		# Apply model-specific configuration (these can override config)
 		if self.temperature is not None:
 			config['temperature'] = self.temperature
-		elif not is_gemini_3_and_later:
-			# Gemini 3 and later models may throw an error if temp is set
+		elif 'gemini-3' not in self.model:
+			# Gemini 3 models may throw an error if temp is set
 			config['temperature'] = 0.5
 
 		# Add system instruction if present
@@ -295,31 +289,45 @@ class ChatGoogle(BaseChatModel):
 			config['seed'] = self.seed
 
 		# Configure thinking based on model version
-		# Gemini 3 and later: uses thinking_level only
+		# Gemini 3 Pro: uses thinking_level only
+		# Gemini 3 Flash: supports both, defaults to thinking_budget=-1
 		# Gemini 2.5: uses thinking_budget only
-		if is_gemini_3_and_later:
-			# Validate: thinking_budget should not be set for Gemini 3 and later
+		is_gemini_3_pro = _GEMINI_3_PRO_RE.search(self.model) is not None
+		is_gemini_3_flash = _GEMINI_3_FLASH_RE.search(self.model) is not None
+
+		if is_gemini_3_pro:
+			# Validate: thinking_budget should not be set for Gemini 3 Pro
 			if self.thinking_budget is not None:
 				self.logger.warning(
-					f'thinking_budget={self.thinking_budget} is deprecated for Gemini 3 and later models, '
-					f'and may cause suboptimal performance. Use thinking_level instead.'
+					f'thinking_budget={self.thinking_budget} is deprecated for Gemini 3 Pro and may cause '
+					f'suboptimal performance. Use thinking_level instead.'
 				)
 
-			# Validate: thinking_level minimal is supported by some models
-			if self.thinking_level == 'minimal' and self.model not in (
-				'gemini-3-flash-preview',
-				'gemini-3.1-flash-lite',
-				'gemini-3.5-flash',
-				'gemini-3.5-flash-lite',
-				'gemini-3.6-flash',
-			):
-				self.logger.warning(f'thinking_level="minimal" is not supported for {self.model}. Falling back to "low".')
+			# Validate: minimal/medium only supported on Flash, not Pro
+			if self.thinking_level in ('minimal', 'medium'):
+				self.logger.warning(
+					f'thinking_level="{self.thinking_level}" is not supported for Gemini 3 Pro. '
+					f'Only "low" and "high" are valid. Falling back to "low".'
+				)
 				self.thinking_level = 'low'
 
+			# Default to 'low' for Gemini 3 Pro
+			if self.thinking_level is None:
+				self.thinking_level = 'low'
+
+			# Map to ThinkingLevel enum (SDK accepts string values)
+			level = types.ThinkingLevel(self.thinking_level.upper())
+			config['thinking_config'] = types.ThinkingConfigDict(thinking_level=level)
+		elif is_gemini_3_flash:
+			# Gemini 3 Flash supports both thinking_level and thinking_budget
+			# If user set thinking_level, use that; otherwise default to thinking_budget=-1
 			if self.thinking_level is not None:
-				# Map to ThinkingLevel enum (SDK accepts string values)
 				level = types.ThinkingLevel(self.thinking_level.upper())
 				config['thinking_config'] = types.ThinkingConfigDict(thinking_level=level)
+			else:
+				if self.thinking_budget is None:
+					self.thinking_budget = -1
+				config['thinking_config'] = types.ThinkingConfigDict(thinking_budget=self.thinking_budget)
 		else:
 			# Gemini 2.5 and earlier: use thinking_budget only
 			if self.thinking_level is not None:
@@ -328,7 +336,7 @@ class ChatGoogle(BaseChatModel):
 					f'Use thinking_budget instead (0 to disable, -1 for dynamic, or token count).'
 				)
 			# Default to -1 for dynamic/auto on 2.5 models
-			if self.thinking_budget is None and 'gemini-2.5' in self.model:
+			if self.thinking_budget is None and ('gemini-2.5' in self.model or 'gemini-flash' in self.model):
 				self.thinking_budget = -1
 			if self.thinking_budget is not None:
 				config['thinking_config'] = types.ThinkingConfigDict(thinking_budget=self.thinking_budget)
