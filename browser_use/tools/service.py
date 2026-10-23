@@ -4,7 +4,7 @@ import json
 import logging
 import math
 import os
-from typing import Generic, TypeVar
+from typing import TypeVar
 
 try:
 	from lmnr import Laminar  # type: ignore
@@ -68,8 +68,6 @@ ClickElementEvent.model_rebuild()
 TypeTextEvent.model_rebuild()
 ScrollEvent.model_rebuild()
 UploadFileEvent.model_rebuild()
-
-Context = TypeVar('Context')
 
 T = TypeVar('T', bound=BaseModel)
 
@@ -437,14 +435,14 @@ def _is_autocomplete_field(node: EnhancedDOMTreeNode) -> bool:
 	return False
 
 
-class Tools(Generic[Context]):
+class Tools:
 	def __init__(
 		self,
 		exclude_actions: list[str] | None = None,
 		output_model: type[T] | None = None,
 		display_files_in_done_text: bool = True,
 	):
-		self.registry = Registry[Context](exclude_actions if exclude_actions is not None else [])
+		self.registry = Registry(exclude_actions if exclude_actions is not None else [])
 		self.display_files_in_done_text = display_files_in_done_text
 		self._output_model: type[BaseModel] | None = output_model
 		self._coordinate_clicking_enabled: bool = False
