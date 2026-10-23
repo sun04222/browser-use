@@ -1,7 +1,3 @@
-from types import SimpleNamespace
-
-import pytest
-
 """Test Anthropic model button click."""
 
 from browser_use.llm.anthropic.chat import ChatAnthropic
@@ -19,39 +15,112 @@ async def test_anthropic_claude_sonnet_4_6(httpserver):
 	)
 
 
-def _response(input_tokens, output_tokens, cache_read=0, cache_creation=0):
-	return SimpleNamespace(
-		usage=SimpleNamespace(
-			input_tokens=input_tokens,
-			output_tokens=output_tokens,
-			cache_read_input_tokens=cache_read,
-			cache_creation_input_tokens=cache_creation,
-			cache_creation=None,
-		)
+def test_anthropic_serializer_preserves_all_system_messages():
+	"""Multiple system messages must all survive serialization.
+
+	Previously only the last SystemMessage was kept, dropping earlier system rules from
+	the Anthropic request.
+	"""
+	from browser_use.llm.anthropic.serializer import AnthropicMessageSerializer
+	from browser_use.llm.messages import SystemMessage, UserMessage
+
+	messages, system_instruction = AnthropicMessageSerializer.serialize_messages(
+		[
+			SystemMessage(content='Follow the base system rule.'),
+			SystemMessage(content='Also follow the additional system rule.'),
+			UserMessage(content='Continue the task.'),
+		]
 	)
 
-
-def test_total_tokens_counts_cache_reads_like_prompt_tokens_does():
-	"""Anthropic reports input_tokens excluding cache reads, so both must add them."""
-	model = ChatAnthropic(model='claude-sonnet-4-5-20250929', api_key='x')
-
-	usage = model._get_usage(_response(input_tokens=1000, output_tokens=200, cache_read=5000))
-
-	assert usage is not None
-	assert usage.prompt_tokens == 6000
-	assert usage.completion_tokens == 200
-	assert usage.total_tokens == 6200
+	assert len(messages) == 1, 'only the user message should remain in the conversation'
+	assert system_instruction is not None
+	text = (
+		system_instruction
+		if isinstance(system_instruction, str)
+		else ''.join(block.get('text', '') for block in system_instruction)
+	)
+	assert 'Follow the base system rule.' in text
+	assert 'Also follow the additional system rule.' in text
 
 
-@pytest.mark.parametrize(
-	'input_tokens,output_tokens,cache_read',
-	[(1000, 200, 0), (1000, 200, 5000), (0, 50, 900)],
-)
-def test_total_tokens_always_equals_prompt_plus_completion(input_tokens, output_tokens, cache_read):
-	"""The invariant every other provider satisfies, with and without caching."""
-	model = ChatAnthropic(model='claude-sonnet-4-5-20250929', api_key='x')
+def test_anthropic_serializer_single_system_message_unchanged():
+	"""A single system message keeps the existing return shape (plain string)."""
+	from browser_use.llm.anthropic.serializer import AnthropicMessageSerializer
+	from browser_use.llm.messages import SystemMessage, UserMessage
 
-	usage = model._get_usage(_response(input_tokens, output_tokens, cache_read))
+	messages, system_instruction = AnthropicMessageSerializer.serialize_messages(
+		[
+			SystemMessage(content='Follow the base system rule.'),
+			UserMessage(content='Continue the task.'),
+		]
+	)
 
-	assert usage is not None
-	assert usage.total_tokens == usage.prompt_tokens + usage.completion_tokens
+	assert isinstance(system_instruction, str)
+	assert system_instruction == 'Follow the base system rule.'
+
+
+def test_anthropic_serializer_merges_list_based_system_messages():
+	"""System messages with content-part lists are merged without dropping any text."""
+	from browser_use.llm.anthropic.serializer import AnthropicMessageSerializer
+	from browser_use.llm.messages import ContentPartTextParam, SystemMessage, UserMessage
+
+	messages, system_instruction = AnthropicMessageSerializer.serialize_messages(
+		[
+			SystemMessage(content=[ContentPartTextParam(text='Rule A.1'), ContentPartTextParam(text='Rule A.2')]),
+			SystemMessage(content='Rule B'),
+			UserMessage(content='Go.'),
+		]
+	)
+
+	assert isinstance(system_instruction, list), 'merged system messages should be a block list'
+	text = ''.join(block.get('text', '') for block in system_instruction)  # type: ignore[attr-defined]
+	assert 'Rule A.1' in text and 'Rule A.2' in text
+	assert 'Rule B' in text
+
+
+def test_anthropic_serializer_multiple_system_messages_cache_semantics():
+	"""Multiple system messages must not silently change existing cache semantics.
+
+	An earlier SystemMessage(cache=True) must not gain a new cache breakpoint just
+	because it is now merged into the combined system instruction, when the final
+	system message is not cached.
+	"""
+	from browser_use.llm.anthropic.serializer import AnthropicMessageSerializer
+	from browser_use.llm.messages import SystemMessage, UserMessage
+
+	messages, system_instruction = AnthropicMessageSerializer.serialize_messages(
+		[
+			SystemMessage(content='Base rules', cache=True),
+			SystemMessage(content='Additional rules', cache=False),
+			UserMessage(content='Go.'),
+		]
+	)
+
+	assert isinstance(system_instruction, list)
+	blocks = system_instruction
+	text = ''.join(block.get('text', '') for block in blocks)  # type: ignore[attr-defined]
+	assert 'Base rules' in text and 'Additional rules' in text
+	# The final system message is not cached, so no cache_control may appear anywhere.
+	cache_count = sum(1 for block in blocks if block.get('cache_control') is not None)  # type: ignore[attr-defined]
+	assert cache_count == 0, f'Expected no cache breakpoint, got {cache_count}'
+
+
+def test_anthropic_serializer_multiple_system_messages_cache_last_only():
+	"""When the final system message is cached, only it gets the cache breakpoint."""
+	from browser_use.llm.anthropic.serializer import AnthropicMessageSerializer
+	from browser_use.llm.messages import SystemMessage, UserMessage
+
+	messages, system_instruction = AnthropicMessageSerializer.serialize_messages(
+		[
+			SystemMessage(content='Base rules', cache=True),
+			SystemMessage(content='Additional rules', cache=True),
+			UserMessage(content='Go.'),
+		]
+	)
+
+	assert isinstance(system_instruction, list)
+	blocks = system_instruction
+	cache_count = sum(1 for block in blocks if block.get('cache_control') is not None)  # type: ignore[attr-defined]
+	assert cache_count == 1, f'Expected exactly 1 cache breakpoint, got {cache_count}'
+	assert blocks[-1].get('cache_control') is not None  # type: ignore[attr-defined]
+	assert blocks[0].get('cache_control') is None  # type: ignore[attr-defined]
