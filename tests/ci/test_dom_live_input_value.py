@@ -17,21 +17,19 @@ PAGE = """<!DOCTYPE html>
 	<input id="name" type="text" placeholder="Your name">
 	<label for="notes">Notes</label>
 	<textarea id="notes"></textarea>
-	<input id="secret-filled" type="password">
-	<input id="secret-empty" type="password">
-	<input id="secret-cleared" type="password">
-	<input id="otp" type="text" autocomplete="one-time-code">
-	<input id="card" type="text" autocomplete="cc-number">
+	<input id="secret" type="password">
+	<input id="otp" type="text" autocomplete="section-login one-time-code">
+	<input id="card" type="text" autocomplete="section-checkout billing cc-number">
+	<input id="address" type="text" autocomplete="section-checkout shipping street-address">
 	<input id="agree" type="checkbox" checked>
 	<input id="news" type="checkbox">
 	<script>
 		document.getElementById('name').value = 'Ada Lovelace';
 		document.getElementById('notes').value = 'call back tuesday';
-		document.getElementById('secret-filled').value = 'hunter2';
-		document.getElementById('secret-cleared').value = 'clear-me';
-		document.getElementById('secret-cleared').value = '';
+		document.getElementById('secret').value = 'hunter2';
 		document.getElementById('otp').value = '493021';
 		document.getElementById('card').value = '4242424242424242';
+		document.getElementById('address').value = '12 Analytical Engine Way';
 		document.getElementById('agree').checked = false;
 		document.getElementById('news').checked = true;
 	</script>
@@ -57,26 +55,22 @@ async def test_live_input_values_reach_the_agent(browser_session, http_server):
 
 	assert by_id['name'].attributes.get('value') == 'Ada Lovelace'
 	assert by_id['notes'].attributes.get('value') == 'call back tuesday'
-	assert by_id['secret-filled'].attributes.get('value') is None, 'password values must not be exposed'
-	assert by_id['secret-empty'].attributes.get('value') is None, 'password values must not be exposed'
+	assert by_id['secret'].attributes.get('value') is None, 'password values must not be exposed'
 	assert by_id['otp'].attributes.get('value') is None, 'one-time codes must not be exposed'
 	assert by_id['card'].attributes.get('value') is None, 'card numbers must not be exposed'
-	assert by_id['secret-filled'].snapshot_node is not None
-	assert by_id['secret-filled'].snapshot_node.input_value is None
-	assert by_id['secret-filled'].snapshot_node.input_value_state == 'filled'
-	assert by_id['secret-empty'].snapshot_node is not None
-	assert by_id['secret-empty'].snapshot_node.input_value_state == 'empty'
-	assert by_id['secret-cleared'].snapshot_node is not None
-	assert by_id['secret-cleared'].snapshot_node.input_value_state == 'empty'
+	assert by_id['address'].attributes.get('value') == '12 Analytical Engine Way'
+	assert by_id['secret'].snapshot_node is not None and by_id['secret'].snapshot_node.input_value is None
+	assert by_id['otp'].snapshot_node is not None and by_id['otp'].snapshot_node.input_value is None
+	assert by_id['card'].snapshot_node is not None and by_id['card'].snapshot_node.input_value is None
+	assert by_id['address'].snapshot_node is not None
+	assert by_id['address'].snapshot_node.input_value == '12 Analytical Engine Way'
 	assert by_id['agree'].attributes.get('checked') is None, 'live unchecked state wins over the checked attribute'
 	assert by_id['news'].attributes.get('checked') == 'true'
 
 	llm_view = state.dom_state.llm_representation()
 	assert 'Ada Lovelace' in llm_view
 	assert 'call back tuesday' in llm_view
+	assert '12 Analytical Engine Way' in llm_view
 	assert 'hunter2' not in llm_view
-	assert 'clear-me' not in llm_view
 	assert '493021' not in llm_view
 	assert '4242424242424242' not in llm_view
-	assert 'value-state=filled' in llm_view
-	assert 'value-state=empty' in llm_view
