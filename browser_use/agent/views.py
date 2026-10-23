@@ -5,12 +5,11 @@ import json
 import logging
 import re
 import traceback
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generic, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, model_validator
 from typing_extensions import TypeVar
 from uuid_extensions import uuid7str
 
@@ -397,7 +396,7 @@ class AgentOutput(BaseModel):
 	plan_update: list[str] | None = None
 	action: list[ActionModel] = Field(
 		...,
-		json_schema_extra={'minItems': 1},  # Ensure at least one action is provided
+		json_schema_extra={'min_items': 1},  # Ensure at least one action is provided
 	)
 
 	@classmethod
@@ -425,7 +424,7 @@ class AgentOutput(BaseModel):
 			__base__=AgentOutput,
 			action=(
 				list[custom_actions],  # type: ignore
-				Field(..., description='List of actions to execute', json_schema_extra={'minItems': 1}),
+				Field(..., description='List of actions to execute', json_schema_extra={'min_items': 1}),
 			),
 			__module__=AgentOutput.__module__,
 		)
@@ -448,7 +447,7 @@ class AgentOutput(BaseModel):
 			__base__=AgentOutputNoThinking,
 			action=(
 				list[custom_actions],  # type: ignore
-				Field(..., json_schema_extra={'minItems': 1}),
+				Field(..., json_schema_extra={'min_items': 1}),
 			),
 			__module__=AgentOutputNoThinking.__module__,
 		)
@@ -478,7 +477,7 @@ class AgentOutput(BaseModel):
 			__base__=AgentOutputFlashMode,
 			action=(
 				list[custom_actions],  # type: ignore
-				Field(..., json_schema_extra={'minItems': 1}),
+				Field(..., json_schema_extra={'min_items': 1}),
 			),
 			__module__=AgentOutputFlashMode.__module__,
 		)
@@ -593,16 +592,8 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 
 	history: list[AgentHistory]
 	usage: UsageSummary | None = None
-	video_path: str | None = None
 
 	_output_model_schema: type[AgentStructuredOutput] | None = None
-
-	@field_validator('video_path', mode='before')
-	@classmethod
-	def _validate_video_path(cls, v: Any) -> str | None:
-		if v is not None:
-			return str(v)
-		return None
 
 	def total_duration_seconds(self) -> float:
 		"""Get total duration of all steps in seconds"""
@@ -670,23 +661,17 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 	# 	except Exception as e:
 	# 		raise e
 
-	def model_dump(self, sensitive_data: dict[str, str | dict[str, str]] | None = None, **kwargs) -> dict[str, Any]:
-		"""Custom serialization that properly uses AgentHistory's model_dump and includes video_path"""
-		dump: dict[str, Any] = {
-			'history': [h.model_dump(sensitive_data=sensitive_data, **kwargs) for h in self.history],
+	def model_dump(self, **kwargs) -> dict[str, Any]:
+		"""Custom serialization that properly uses AgentHistory's model_dump"""
+		# 'sensitive_data' is only understood by AgentHistory.model_dump, not by UsageSummary
+		usage_kwargs = {k: v for k, v in kwargs.items() if k not in ('sensitive_data', 'include', 'exclude')}
+		return {
+			'history': [h.model_dump(**kwargs) for h in self.history],
+			'usage': self.usage.model_dump(**usage_kwargs) if self.usage else None,
 		}
-		if not kwargs.get('exclude_none') or self.video_path is not None:
-			video_path = self.video_path
-			if video_path is not None and sensitive_data:
-				sensitive_values = collect_sensitive_data_values(sensitive_data)
-				video_path = redact_sensitive_string(video_path, sensitive_values)
-			dump['video_path'] = video_path
-		return dump
 
 	@classmethod
 	def load_from_dict(cls, data: dict[str, Any], output_model: type[AgentOutput]) -> AgentHistoryList:
-		"""Load serialized history without modifying the caller's data."""
-		data = deepcopy(data)
 		# loop through history and validate output_model actions to enrich with custom actions
 		for h in data.get('history', []):
 			# Use .get() to avoid KeyError on incomplete or legacy history entries
@@ -981,7 +966,7 @@ class AgentError:
 			return AgentError.RATE_LIMIT_ERROR
 
 		# Handle LLM response validation errors from llm_use
-		error_str = str(error) or type(error).__name__
+		error_str = str(error)
 		if 'LLM response missing required fields' in error_str or 'Expected format: AgentOutput' in error_str:
 			# Extract the main error message without the huge stacktrace
 			lines = error_str.split('\n')
@@ -996,8 +981,8 @@ class AgentError:
 			return helpful_msg
 
 		if include_trace:
-			return f'{error_str}\nStacktrace:\n{traceback.format_exc()}'
-		return error_str
+			return f'{str(error)}\nStacktrace:\n{traceback.format_exc()}'
+		return f'{str(error)}'
 
 
 class DetectedVariable(BaseModel):
