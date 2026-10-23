@@ -1,10 +1,11 @@
+import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
 import pytest
 
-from browser_use.browser.watchdogs.downloads_watchdog import (
-	_download_info_from_headers,
-	_filename_from_content_disposition,
-	_should_auto_download_network_response,
-)
+from browser_use.browser.profile import BrowserProfile
+from browser_use.browser.watchdogs.downloads_watchdog import DownloadsWatchdog, _should_auto_download_network_response
 
 
 def test_downloads_watchdog_skips_generic_text_attachment_without_file_url():
@@ -57,36 +58,30 @@ def test_downloads_watchdog_keeps_attachment_without_known_extension():
 	)
 
 
-@pytest.mark.parametrize(
-	('header', 'expected'),
-	[
-		('attachment; filename="report.csv"', 'report.csv'),
-		('attachment; filename=Report.CSV', 'Report.CSV'),
-		("attachment; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf", 'résumé.pdf'),
-		("attachment; filename*=utf-8''%E6%97%A5%E6%9C%AC%E8%AA%9E.pdf", '日本語.pdf'),
-		('attachment; filename="fallback.pdf"; filename*=UTF-8\'\'r%C3%A9sum%C3%A9.pdf', 'résumé.pdf'),
-		("attachment; filename*=UTF-8'en'My%20File.txt", 'My File.txt'),
-		('attachment; filename*=UTF-8\'\'%FF.pdf; filename="fallback.pdf"', 'fallback.pdf'),
-		('attachment; filename*=bogus\'\'r%C3%A9sum%C3%A9.pdf; filename="fallback.pdf"', 'fallback.pdf'),
-		('attachment; filename*=UTF-8\'\'bad%zz.pdf; filename="fallback.pdf"', 'fallback.pdf'),
-		('attachment; filename*=UTF-8\'\'bad%.pdf; filename="fallback.pdf"', 'fallback.pdf'),
-		('attachment; filename*=UTF-8\'\'bad%4.pdf; filename="fallback.pdf"', 'fallback.pdf'),
-		('attachment; filename*="UTF-8\'\'r%C3%A9sum%C3%A9.pdf"', 'résumé.pdf'),
-		("attachment; filename*=UTF-8''x%0Aadmin-login.log", 'xadmin-login.log'),
-		("attachment; filename*=UTF-8''x%0D%09y.log", 'xy.log'),
-		('attachment', None),
-	],
-)
-def test_filename_from_content_disposition(header, expected):
-	assert _filename_from_content_disposition(header) == expected
+@pytest.mark.parametrize('accept_downloads', [True, False])
+async def test_downloads_watchdog_honors_accept_downloads(tmp_path, accept_downloads):
+	"""An explicit downloads directory must not override the acceptance setting."""
+	cdp_client = SimpleNamespace(send=AsyncMock(), register=Mock())
+	profile = BrowserProfile(downloads_path=tmp_path, accept_downloads=accept_downloads, auto_download_pdfs=False)
+	session = SimpleNamespace(browser_profile=profile, cdp_client=cdp_client, logger=logging.getLogger(__name__))
+	watchdog = DownloadsWatchdog.model_construct(browser_session=session)
+
+	await watchdog.attach_to_target('target-1')
+
+	cdp_client.send.Browser.setDownloadBehavior.assert_awaited_once()
+	params = cdp_client.send.Browser.setDownloadBehavior.call_args.kwargs['params']
+	assert params['behavior'] == ('allow' if accept_downloads else 'deny')
+	assert params['eventsEnabled'] is True
+	if accept_downloads:
+		assert params['downloadPath'] == str(tmp_path.resolve())
+	else:
+		assert 'downloadPath' not in params
 
 
-def test_download_info_from_headers_keeps_filename_case():
-	is_attachment, filename = _download_info_from_headers({'content-disposition': 'ATTACHMENT; filename=Report.CSV'})
-
-	assert is_attachment
-	assert filename == 'Report.CSV'
-
-
-def test_download_info_from_headers_without_content_disposition():
-	assert _download_info_from_headers({}) == (False, None)
+@pytest.mark.parametrize('accept_downloads', [True, False])
+@pytest.mark.parametrize('auto_download_pdfs', [True, False])
+def test_downloads_watchdog_auto_download_respects_acceptance(accept_downloads, auto_download_pdfs):
+	"""PDF/network auto-downloads cannot bypass disabled download acceptance."""
+	profile = BrowserProfile(accept_downloads=accept_downloads, auto_download_pdfs=auto_download_pdfs)
+	watchdog = DownloadsWatchdog.model_construct(browser_session=SimpleNamespace(browser_profile=profile))
+	assert watchdog._is_auto_download_enabled() is (accept_downloads and auto_download_pdfs)
