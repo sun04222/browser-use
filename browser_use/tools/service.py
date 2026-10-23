@@ -493,8 +493,9 @@ class Tools:
 				logger.info(msg)
 				return ActionResult(extracted_content=memory, long_term_memory=memory)
 			except Exception as e:
-				logger.error(f'Failed to search {params.engine}: {e}')
-				return ActionResult(error=f'Failed to search {params.engine} for "{params.query}": {str(e)}')
+				error_msg = str(e) or type(e).__name__
+				logger.error(f'Failed to search {params.engine}: {error_msg}')
+				return ActionResult(error=f'Failed to search {params.engine} for "{params.query}": {error_msg}')
 
 		@self.registry.action(
 			'',
@@ -550,7 +551,7 @@ class Tools:
 				logger.info(msg)
 				return ActionResult(extracted_content=msg, long_term_memory=memory)
 			except Exception as e:
-				error_msg = str(e)
+				error_msg = str(e) or type(e).__name__
 				# Always log the actual error first for debugging
 				browser_session.logger.error(f'❌ Navigation failed: {error_msg}')
 
@@ -575,7 +576,7 @@ class Tools:
 					return ActionResult(error=site_unavailable_msg)
 				else:
 					# Return error in ActionResult instead of re-raising
-					return ActionResult(error=f'Navigation failed: {str(e)}')
+					return ActionResult(error=f'Navigation failed: {error_msg}')
 
 		@self.registry.action('Go back', param_model=NoParamsAction, terminates_sequence=True)
 		async def go_back(_: NoParamsAction, browser_session: BrowserSession):
@@ -588,7 +589,7 @@ class Tools:
 				return ActionResult(extracted_content=memory)
 			except Exception as e:
 				logger.error(f'Failed to dispatch GoBackEvent: {type(e).__name__}: {e}')
-				error_msg = f'Failed to go back: {str(e)}'
+				error_msg = f'Failed to go back: {str(e) or type(e).__name__}'
 				return ActionResult(error=error_msg)
 
 		@self.registry.action('Wait for x seconds.')
@@ -695,7 +696,9 @@ class Tools:
 			except BrowserError as e:
 				return handle_browser_error(e)
 			except Exception as e:
-				error_msg = f'Failed to click at coordinates ({params.coordinate_x}, {params.coordinate_y}): {e}'
+				error_msg = (
+					f'Failed to click at coordinates ({params.coordinate_x}, {params.coordinate_y}): {str(e) or type(e).__name__}'
+				)
 				return ActionResult(error=error_msg)
 
 		async def _click_by_index(
@@ -758,7 +761,7 @@ class Tools:
 			except BrowserError as e:
 				return handle_browser_error(e)
 			except Exception as e:
-				error_msg = f'Failed to click element {params.index}: {str(e)}'
+				error_msg = f'Failed to click element {params.index}: {str(e) or type(e).__name__}'
 				return ActionResult(error=error_msg)
 
 		# Store click handlers for re-registration
@@ -851,7 +854,7 @@ class Tools:
 			except Exception as e:
 				# Log the full error for debugging
 				logger.error(f'Failed to dispatch TypeTextEvent: {type(e).__name__}: {e}')
-				error_msg = f'Failed to type text into element {params.index}: {e}'
+				error_msg = f'Failed to type text into element {params.index}: {str(e) or type(e).__name__}'
 				return ActionResult(error=error_msg)
 
 		@self.registry.action(
@@ -994,7 +997,7 @@ class Tools:
 				)
 			except Exception as e:
 				logger.error(f'Failed to upload file: {e}')
-				raise BrowserError(f'Failed to upload file: {e}')
+				raise BrowserError(f'Failed to upload file: {str(e) or type(e).__name__}')
 
 		# Tab Management Actions
 
@@ -1017,7 +1020,7 @@ class Tools:
 				logger.warning(f'Tab switch failed: {e}')
 				# Preserve the concrete cause (e.g. a stale tab_id) instead of a generic
 				# message, so the agent gets actionable failure info in both memories.
-				memory = f'Failed to switch to tab #{params.tab_id}: {e}'
+				memory = f'Failed to switch to tab #{params.tab_id}: {str(e) or type(e).__name__}'
 				raise BrowserError(memory, short_term_memory=memory, long_term_memory=memory)
 
 			# on_SwitchTabEvent returns the newly focused TargetID on every success path, so a
@@ -1494,7 +1497,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				return ActionResult(extracted_content=memory, long_term_memory=memory)
 			except Exception as e:
 				logger.error(f'Failed to dispatch SendKeysEvent: {type(e).__name__}: {e}')
-				error_msg = f'Failed to send keys: {str(e)}'
+				error_msg = f'Failed to send keys: {str(e) or type(e).__name__}'
 				return ActionResult(error=error_msg)
 
 		@self.registry.action('Scroll to text.')
