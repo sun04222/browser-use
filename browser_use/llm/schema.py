@@ -25,7 +25,9 @@ class SchemaOptimizer:
 			model: The Pydantic model to optimize
 			remove_min_items: If True, remove minItems from the schema
 			remove_defaults: If True, remove default values from the schema
-			make_strict: If True, require all object properties for OpenAI strict mode
+			make_strict: If True, mark every property as required (OpenAI strict mode).
+				Set to False to preserve the model's own `required` arrays (e.g. Gemini,
+				which respects optional fields).
 
 		Returns:
 			Optimized schema with all $refs resolved. OpenAI strict-mode compatibility
