@@ -108,7 +108,11 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+<<<<<<< ours
 See `models.md` for all 15+ providers.
+=======
+See `references/models.md` for all 15+ providers.
+>>>>>>> theirs
 
 ---
 
