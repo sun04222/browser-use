@@ -1,30 +1,20 @@
+import asyncio
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import anyio
 import pytest
+from websockets.protocol import State
 
-from browser_use.browser.events import SaveStorageStateEvent
 from browser_use.browser.session import BrowserSession
 from browser_use.browser.watchdogs.storage_state_watchdog import StorageStateWatchdog
 
 
-@pytest.mark.parametrize('storage_state', [None, {}, {'cookies': [], 'origins': []}])
-async def test_save_without_a_file_destination_does_not_connect(storage_state, monkeypatch: pytest.MonkeyPatch):
-	browser_session = BrowserSession(storage_state=storage_state)
-	connect = AsyncMock(side_effect=AssertionError('Root CDP client not initialized'))
-	monkeypatch.setattr(BrowserSession, 'get_or_create_cdp_session', connect)
-	watchdog = StorageStateWatchdog.model_construct(event_bus=browser_session.event_bus, browser_session=browser_session)
-
-	await watchdog.on_SaveStorageStateEvent(SaveStorageStateEvent())
-
-	connect.assert_not_awaited()
-
-
 def _make_watchdog() -> tuple[StorageStateWatchdog, MagicMock]:
 	browser_session = MagicMock()
-	browser_session.is_cdp_connected = True
+	browser_session.cdp_client = object()
 	browser_session.get_or_create_cdp_session = AsyncMock(return_value=object())
 	browser_session._cdp_get_storage_state = AsyncMock(return_value={'cookies': [], 'origins': []})
 	browser_session._cdp_set_cookies = AsyncMock()
@@ -121,37 +111,59 @@ async def test_save_storage_state_reads_existing_file_as_utf8(tmp_path: Path, mo
 	assert saved_cookies == {'greeting': unicode_value, 'current': 'new-value'}
 
 
-async def test_save_storage_state_skips_when_no_cdp_client(tmp_path: Path):
-	"""Regression test for #6005: stop()/kill() dispatch SaveStorageStateEvent even when the
-	root CDP client was never initialized; the save must return quietly instead of raising
-	"AssertionError: Root CDP client not initialized"."""
-	watchdog, browser_session = _make_watchdog()
-	# cubic P1 (PR #6019): the guard must use is_cdp_connected, since the cdp_client
-	# property itself asserts when the root CDP client is unset — i.e. on a REAL
-	# session `cdp_client is None` can never be evaluated. Configure the mock so
-	# is_cdp_connected returns False (no browser connection) and the property path
-	# would still raise if the guard were ever switched back to it.
-	browser_session.cdp_client = property(lambda self: (_ for _ in ()).throw(AssertionError('Root CDP client not initialized')))
-	browser_session.is_cdp_connected = False
-	browser_session.browser_profile.storage_state = str(tmp_path / 'storage-state.json')
-	browser_session.get_or_create_cdp_session = AsyncMock(side_effect=AssertionError('Root CDP client not initialized'))
-
-	# Must not raise
-	await watchdog._save_storage_state()
-
-	browser_session.get_or_create_cdp_session.assert_not_awaited()
+def _make_unconnected_watchdog() -> tuple[StorageStateWatchdog, BrowserSession]:
+	browser_session = BrowserSession(headless=True)
+	watchdog = StorageStateWatchdog.model_construct(
+		event_bus=browser_session.event_bus, browser_session=browser_session, auto_save_interval=0.01
+	)
+	return watchdog, browser_session
 
 
-async def test_save_storage_state_skips_when_no_save_path():
-	"""Regression test for #6005: the save-path check must run before any CDP session
-	creation, so a save with no configured storage state never touches CDP."""
-	watchdog, browser_session = _make_watchdog()
-	browser_session.cdp_client = property(lambda self: (_ for _ in ()).throw(AssertionError('Root CDP client not initialized')))
-	browser_session.is_cdp_connected = False
-	browser_session.browser_profile.storage_state = None
-	browser_session.get_or_create_cdp_session = AsyncMock(side_effect=AssertionError('Root CDP client not initialized'))
+async def test_cookie_checks_without_a_cdp_client_do_not_raise():
+	watchdog, _ = _make_unconnected_watchdog()
 
-	# Must not raise even though no CDP client exists and no path is configured
-	await watchdog._save_storage_state()
+	assert await watchdog._have_cookies_changed() is False
+	assert await watchdog.get_current_cookies() == []
+	await watchdog.add_cookies([])
 
-	browser_session.get_or_create_cdp_session.assert_not_awaited()
+
+async def test_monitoring_loop_logs_no_error_once_the_cdp_client_is_gone(
+	caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+):
+	watchdog, browser_session = _make_unconnected_watchdog()
+	cookie_checked = asyncio.Event()
+
+	async def get_cookies(_session: BrowserSession) -> list:
+		cookie_checked.set()
+		return []
+
+	monkeypatch.setattr(BrowserSession, '_cdp_get_cookies', get_cookies)
+	browser_session._cdp_client_root = MagicMock()
+	browser_session._cdp_client_root.ws.state = State.OPEN
+	assert browser_session.is_cdp_connected
+	await watchdog._start_monitoring()
+
+	browser_use_logger = logging.getLogger('browser_use')
+	browser_use_logger.addHandler(caplog.handler)
+	try:
+		async with asyncio.timeout(1):
+			await cookie_checked.wait()
+		browser_session._cdp_client_root = None
+		await asyncio.sleep(0.1)
+	finally:
+		browser_use_logger.removeHandler(caplog.handler)
+		await watchdog._stop_monitoring()
+
+	assert [record.getMessage() for record in caplog.records if record.levelno >= logging.ERROR] == []
+
+
+async def test_reset_stops_the_storage_state_monitoring_loop():
+	watchdog, browser_session = _make_unconnected_watchdog()
+	browser_session._cdp_client_root = AsyncMock()
+	browser_session._storage_state_watchdog = watchdog
+	await watchdog._start_monitoring()
+
+	await browser_session.reset()
+
+	assert watchdog._monitoring_task is not None
+	assert watchdog._monitoring_task.done()
