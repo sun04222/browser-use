@@ -225,7 +225,7 @@ def _parse_atomic_blocks(content: str) -> list[_AtomicBlock]:
 	i = 0
 	offset = 0  # char offset tracking
 
-	while i < len(lines):
+	while i < len(lines) and offset < len(content):
 		line = lines[i]
 		line_len = len(line) + 1  # +1 for the newline we split on
 
@@ -378,36 +378,20 @@ def _parse_atomic_blocks(content: str) -> list[_AtomicBlock]:
 		)
 		offset = para_end
 
-	# Re-derive block offsets from the text each block actually renders.
-	#
-	# The walk above counts `len(line) + 1` per line, as if every line were followed by a
-	# newline. That overshoots the final line of every block, and blocks are joined with a
-	# single '\n' when rendered (see _block_text / chunk assembly), not by concatenating
-	# their lines raw. Left uncorrected, each block's char_end lands one char past the end
-	# of its own text, so chunk.char_offset_end points one past the end of chunk.content.
-	#
-	# extract() publishes those offsets to the model as `truncated_at_char` and
-	# `next_start_char` (browser_use/tools/service.py), so they must describe exactly the
-	# text the model was given. Re-deriving them here keeps every block's char_end equal to
-	# char_start + len(_block_text(block)), with one separator newline between blocks, which
-	# makes the chunk span and its content agree by construction.
-	cursor = 0
-	normalized: list[_AtomicBlock] = []
-	for index, block in enumerate(blocks):
-		if index:
-			cursor += 1  # the '\n' that joins this block to the previous one
-		block_text = _block_text(block)
-		normalized.append(
-			_AtomicBlock(
-				block_type=block.block_type,
-				lines=block.lines,
-				char_start=cursor,
-				char_end=cursor + len(block_text),
-			)
+	# Fix last block char_end: the parser counts +1 per line for the newline it
+	# split on, so content ending in \n (or a final blank line) overshoots len(content).
+	if blocks and content and blocks[-1].char_end > len(content):
+		blocks[-1] = _AtomicBlock(
+			block_type=blocks[-1].block_type,
+			lines=blocks[-1].lines,
+			char_start=blocks[-1].char_start,
+			char_end=len(content),
 		)
-		cursor += len(block_text)
 
-	return normalized
+	# Filter out any zero-width blocks (e.g. char_start == char_end)
+	blocks = [b for b in blocks if b.char_end > b.char_start]
+
+	return blocks
 
 
 def _block_text(block: _AtomicBlock) -> str:
@@ -475,20 +459,12 @@ def chunk_markdown_by_structure(
 	current_chunk: list[_AtomicBlock] = []
 	current_size = 0
 
-	def _rendered_size(blocks_in_chunk: list[_AtomicBlock]) -> int:
-		"""Size of the text the chunk assembly will render for these blocks.
-
-		Blocks are joined with a single separator newline (see the chunk text
-		below), so the separators count towards the limit as well. Leaving them
-		out lets a chunk of many small blocks grow past `max_chunk_chars`.
-		"""
-		return sum(b.char_end - b.char_start for b in blocks_in_chunk) + max(len(blocks_in_chunk) - 1, 0)
-
 	for block in blocks:
 		block_size = block.char_end - block.char_start
-		separator_size = 1 if current_chunk else 0
+		if block_size <= 0:
+			continue
 		# If adding this block would exceed limit AND we already have content, emit chunk
-		if current_size + separator_size + block_size > max_chunk_chars and current_chunk:
+		if current_size + block_size > max_chunk_chars and current_chunk:
 			# Prefer splitting at a header boundary within the current chunk.
 			# Scan backwards for the last HEADER block; if found and it wouldn't
 			# create a tiny chunk (< 50% of limit), split right before it so the
@@ -496,17 +472,16 @@ def chunk_markdown_by_structure(
 			best_split = len(current_chunk)
 			for j in range(len(current_chunk) - 1, 0, -1):
 				if current_chunk[j].block_type == _BlockType.HEADER:
-					prefix_size = _rendered_size(current_chunk[:j])
+					prefix_size = sum(b.char_end - b.char_start for b in current_chunk[:j])
 					if prefix_size >= max_chunk_chars * 0.5:
 						best_split = j
 						break
 			raw_chunks.append(current_chunk[:best_split])
 			# Carry remaining blocks (from the header onward) into the next chunk
 			current_chunk = current_chunk[best_split:]
-			current_size = _rendered_size(current_chunk)
-			separator_size = 1 if current_chunk else 0
+			current_size = sum(b.char_end - b.char_start for b in current_chunk)
 		current_chunk.append(block)
-		current_size += separator_size + block_size
+		current_size += block_size
 
 	if current_chunk:
 		raw_chunks.append(current_chunk)
@@ -522,6 +497,13 @@ def chunk_markdown_by_structure(
 		chunk_text = '\n'.join(_block_text(b) for b in chunk_blocks)
 		char_start = chunk_blocks[0].char_start
 		char_end = chunk_blocks[-1].char_end
+
+		# Preserve trailing newlines on the final chunk if present in source content
+		if idx == total_chunks - 1 and content.endswith('\n'):
+			content_trailing = len(content) - len(content.rstrip('\n'))
+			chunk_trailing = len(chunk_text) - len(chunk_text.rstrip('\n'))
+			if chunk_trailing < content_trailing:
+				chunk_text += '\n' * (content_trailing - chunk_trailing)
 
 		# Build overlap prefix
 		overlap = ''
