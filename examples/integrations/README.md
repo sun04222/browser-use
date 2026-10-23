@@ -5,7 +5,6 @@ This directory is for examples that show Browser Use working with external produ
 ## Shipped integrations
 
 - [Anthropic Browser Use](anthropic/README.md) - Run the Anthropic SDK tool runner with Browser Use and Bash.
-- [Baizhi Cloud Browser](capybrowser/README.md) - Run a public reading task in a temporary cloud browser and explicitly check Session release and billing.
 
 ## Where to put integration contributions
 
@@ -34,4 +33,4 @@ Add entries in this format:
 - [Project name](https://github.com/org/project) - One sentence about what it integrates with. Maintained by @github-handle.
 ```
 
-- [rea-captcha](https://github.com/masakaai/rea-captcha) - Adds same-session verification challenge handling to Browser Use and Playwright workflows, automating only owned/provider-test flows and requiring fresh evidence before resume. Maintained by @IRONICBo.
+- [Surface](https://github.com/Surface-ops/surface/tree/main/examples) - Surface: remote MCP URL preflight (preflight_url) to unwrap redirects and get a fetch/skip verdict before the agent navigates. Maintained by @Surface-ops.
